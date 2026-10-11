@@ -41,6 +41,7 @@ node server.mjs                       # 或 docker compose up -d
 - 上游额度卡片默认是空的（`config.quota` 不填就不显示）；返回形状各家不同，改 `upstreamBalance()` / `upstreamUsage()` 两个函数。
 - 反代后面要关掉响应缓冲，否则流式会被攒成一坨再吐。
 - 面板挂公网默认单步验证（`config.dashboard_auth.hosts`）。
+- `responses`-`messages`没做互转。
 
 ## 目录
 
