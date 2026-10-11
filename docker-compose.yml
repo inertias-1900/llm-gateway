@@ -1,3 +1,4 @@
+# 最小化 LLM 网关：零依赖 Node 服务，只绑本机，对外交给反代 / 隧道
 services:
   gateway:
     image: node:24-alpine            # 需要 Node ≥ 22.5（内置 node:sqlite）

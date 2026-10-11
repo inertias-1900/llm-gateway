@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 /**
- * 网关核心：对客户端暴露 OpenAI Chat Completions，按模型路由到不同上游/不同协议。
- * - 上游 formats: "chat" = 原样透传 /chat/completions；"responses" = 翻译成 /v1/responses 再翻回来
- * - 鉴权：虚拟 key（Bearer 或 x-api-key）；可为每个 key 配一个稳定的上游会话标识头（providers.<name>.extra_headers）
- * - 统计：每条请求落 stats/requests-YYYY-MM-DD.jsonl（按天分文件），超过 3 天的自动 gzip
+ * 最小化 LLM 网关（零依赖，只用 Node 内置模块）
+ *
+ * - 对外三条入口：/v1/chat/completions（OpenAI chat）、/v1/responses、/v1/messages
+ * - 对内按模型名路由到不同上游：chat 客户端可与任意协议的上游双向转换（chat ↔ responses / messages）；
+ *   responses / messages 原生客户端走同协议直通（不做翻译）
+ * - 鉴权：虚拟 key（Bearer 或 x-api-key）；可为每个 key 配稳定的上游会话标识头（providers.<name>.extra_headers）
+ * - 统计：每条请求落 SQLite（stats/requests.db）；stats/*.jsonl 只滚动留 3 天，供 grep / 取证
  */
 import http from 'node:http';
 import fs from 'node:fs';

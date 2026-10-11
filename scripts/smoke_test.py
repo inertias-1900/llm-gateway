@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""网关冒烟测试：改完配置/代码后跑一遍。不打印任何 key。
+"""最小化 LLM 网关的冒烟测试：改完配置/代码后跑一遍。不打印任何 key。
 
 用法: python3 smoke_test.py [base_url]        # 默认 http://127.0.0.1:8010
 环境: GW_BASE=... GW_CFG=config.json 路径
