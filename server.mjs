@@ -158,9 +158,13 @@ CREATE TABLE IF NOT EXISTS rollup_hour(
   PRIMARY KEY(hour, model, provider, key)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 `);
+try {   // 迁移：加 cproto（客户端协议），便于排查「哪个协议来的请求」
+    const cols = DB.prepare('PRAGMA table_info(requests)').all().map((c) => c.name);
+    if (!cols.includes('cproto')) { DB.exec('ALTER TABLE requests ADD COLUMN cproto TEXT'); log('migrate: requests + cproto'); }
+} catch (e) { log('migrate cproto fail', e.message); }
 const INS_REQ = DB.prepare(`INSERT INTO requests(ts,key,model,provider,upstream_model,format,status,ms,ttft_ms,stream,passthrough,ip,
- in_tok,out_tok,cached,reasoning,has_tool,reason_inj,req_bytes,res_bytes,up_res_bytes,usage_src,last_evt,error,conv)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+ in_tok,out_tok,cached,reasoning,has_tool,reason_inj,req_bytes,res_bytes,up_res_bytes,usage_src,last_evt,error,conv,cproto)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
 const INS_ROLL = DB.prepare(`INSERT INTO rollup_hour(hour,model,provider,key,requests,errors,in_tok,out_tok,cached,reasoning,ms,ttft,bytes_in,bytes_out,bytes_res)
  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
  ON CONFLICT(hour,model,provider,key) DO UPDATE SET
@@ -174,7 +178,7 @@ function dbInsert(r) {                     // 落库：明细表 + 小时汇总�
         st, num(r.ms), r.ttft_ms ?? null, r.stream ? 1 : 0, r.passthrough ? 1 : 0, r.ip ?? null,
         num(u.in), num(u.out), num(u.cached), num(u.reasoning), r.has_tool ? 1 : 0, num(r.reason_inj),
         num(r.req_bytes), num(r.res_bytes), num(r.up_res_bytes),
-        r.usage_src ?? null, r.last_evt ?? null, r.error ?? null, r.conv ?? null);
+        r.usage_src ?? null, r.last_evt ?? null, r.error ?? null, r.conv ?? null, r.cproto ?? null);
     INS_ROLL.run(Math.floor(ts / HOUR) * HOUR, modelKey(r.model), providerKey(r.provider), keyKey(r.key),
         1, st >= 400 ? 1 : 0, num(u.in), num(u.out), num(u.cached), num(u.reasoning),
         num(r.ms), num(r.ttft_ms), num(r.req_bytes), num(r.up_res_bytes), num(r.res_bytes));
@@ -315,7 +319,7 @@ function rowToRecord(x) {                   // SQL 行 → 前端用的记录形
         status: x.status, ms: x.ms, ttft_ms: x.ttft_ms, stream: !!x.stream, passthrough: !!x.passthrough, ip: x.ip,
         usage: { in: x.in_tok || 0, out: x.out_tok || 0, cached: x.cached || 0, reasoning: x.reasoning || 0 },
         has_tool: !!x.has_tool, reason_inj: x.reason_inj, req_bytes: x.req_bytes, res_bytes: x.res_bytes,
-        up_res_bytes: x.up_res_bytes, usage_src: x.usage_src, last_evt: x.last_evt, error: x.error, conv: x.conv,
+        up_res_bytes: x.up_res_bytes, usage_src: x.usage_src, last_evt: x.last_evt, error: x.error, conv: x.conv, cproto: x.cproto,
     };
 }
 function reqOptions() {                    // 筛选下拉的可选项：直接从库里取 DISTINCT
@@ -536,7 +540,7 @@ function authenticate(req) {
     const bearer = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
     const key = bearer || (req.headers['x-api-key'] || '').trim();
     const hit = KEYS.get(key);
-    return hit ? { name: hit.name, session_id: hit.session_id, key, protocol: hit.protocol || '' } : null;
+    return hit ? { name: hit.name, session_id: hit.session_id, key, protocol: hit.protocol || '', interop: !!hit.protocol_interop } : null;
 }
 function routeFor(model) {
     for (const r of CFG.routes || []) {
@@ -849,49 +853,6 @@ function sseHandle(raw, ctx, emit) {
     }
 }
 
-async function relayResponses(upRes, res, ctx) {
-    const reader = upRes.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '', started = false, toolIdx = -1, ttft = null;
-    const send = (o) => res.write('data: ' + jdump(o) + '\n\n');
-    const chunk = (delta, fr = null) => send({
-        id: ctx.id, object: 'chat.completion.chunk', created: ctx.created, model: ctx.model,
-        choices: [{ index: 0, delta, finish_reason: fr }],
-    });
-    const emit = {
-        start() { if (!started) { started = true; chunk({ role: 'assistant' }); } },
-        delta(d) { if (ttft == null) ttft = Date.now() - ctx.t0; chunk(d); },
-        tool() { },
-    };
-    // tool 需要单独的 index 维护
-    let pendingTool = null;
-    emit.tool = (t) => {
-        if (t.id) { toolIdx++; pendingTool = { idx: toolIdx, id: t.id, name: t.name, sent: 0 }; ctx.hasTool = true; chunk({ tool_calls: [{ index: toolIdx, id: t.id, type: 'function', function: { name: t.name, arguments: '' } }] }); }
-        else if (pendingTool && t.argsDelta) { pendingTool.sent += t.argsDelta.length; chunk({ tool_calls: [{ index: pendingTool.idx, function: { arguments: t.argsDelta } }] }); }
-    };
-    emit.toolSent = () => (pendingTool ? pendingTool.sent : 0);
-    for (; ;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) ctx.up_res_bytes = (ctx.up_res_bytes || 0) + value.length;
-        buf += dec.decode(value, { stream: true });
-        let i;
-        while ((i = buf.indexOf('\n\n')) >= 0) {
-            const raw = buf.slice(0, i); buf = buf.slice(i + 2);
-            if (raw.trim()) sseHandle(raw, ctx, emit);
-        }
-    }
-    if (buf.trim()) sseHandle(buf, ctx, emit);
-    emit.start();
-    chunk({}, ctx.hasTool ? 'tool_calls' : 'stop');
-    // 把 usage 作为最后一个 chunk 吐给客户端（chat 流式的标准做法：choices 为空数组）
-    if (Object.keys(ctx.usage).length) {
-        send({ id: ctx.id, object: 'chat.completion.chunk', created: ctx.created, model: ctx.model, choices: [], usage: usageToChat(ctx.usage) });
-    }
-    res.write('data: [DONE]\n\n');
-    if (ttft != null) ctx.ttft = ttft;
-}
-
 function responsesToChatJson(d, ctx) {
     const texts = [], reasoning = [], toolCalls = [];
     const pending = [];
@@ -1060,12 +1021,233 @@ function messagesToChatJson(d, ctx) {
     };
 }
 
-async function relayMessages(upRes, res, ctx) {
-    const reader = upRes.body.getReader(); const dec = new TextDecoder();
-    let buf = '', started = false, ttft = null, toolIdx = -1, curTool = null, stopReason = 'end_turn';
+// ---------------- 协议互转：三种客户端协议 × 三种上游协议 ----------------
+// 中枢＝chat。非 chat 客户端先把请求翻成 chat（responsesToChatReq / messagesToChatReq），
+// 复用既有的 chat→上游 路由与翻译（buildUpstream）；上游响应先归一到 chat 事件（pump*），
+// 再由对应 sink 渲染成客户端自己的协议（chatSink / responsesSink / messagesSink）。
+// 同协议（responses↔responses、messages↔messages）仍走原生直通，保真度最高；本层只在协议不匹配时启用。
+// 口径参考 LiteLLM 的 v1/messages→/responses 映射表；responses 事件顺序按 OpenAI/Azure 官方流：
+//   response.created → in_progress → output_item.added → content_part.added → output_text.delta
+//   → output_text.done → content_part.done → output_item.done → response.completed
+// —— 缺 content_part.added 会让 Codex 报 "OutputTextDelta without active item" 并**丢弃全部正文**（实测先例）。
+const SSE_HEADERS = { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' };
+const randId = (p) => p + crypto.randomBytes(12).toString('hex');
+const usageToResponses = (u) => (u && Object.keys(u).length) ? {
+    input_tokens: u.in || 0, output_tokens: u.out || 0, total_tokens: u.total || ((u.in || 0) + (u.out || 0)),
+    input_tokens_details: { cached_tokens: u.cached || 0 },
+    output_tokens_details: { reasoning_tokens: u.reasoning || 0 },
+} : null;
+const finishOf = (ctx) => ctx.finishReason || (ctx.hasTool ? 'tool_calls' : 'stop');
+const normToolChoice = (tc, from) => {
+    if (tc == null || typeof tc === 'string') return tc;
+    if (from === 'anthropic') {
+        if (tc.type === 'any') return 'required';
+        if (tc.type === 'tool') return { type: 'function', function: { name: tc.name } };
+        return tc.type;
+    }
+    if (tc.type === 'function') return { type: 'function', function: { name: tc.name || tc.function?.name } };
+    return tc;
+};
+
+// ---- sink: chat SSE（与旧 relay* 直接写出的形状等价）----
+function chatSink(res, ctx) {
+    let started = false, toolIdx = -1, curIdx = null;
+    const byUp = new Map(), sentByIdx = new Map();
+    const mark = () => { if (ctx.ttft == null) ctx.ttft = Date.now() - ctx.t0; };
     const send = (o) => res.write('data: ' + jdump(o) + '\n\n');
     const chunk = (delta, fr = null) => send({ id: ctx.id, object: 'chat.completion.chunk', created: ctx.created, model: ctx.model, choices: [{ index: 0, delta, finish_reason: fr }] });
-    const start = () => { if (!started) { started = true; chunk({ role: 'assistant' }); } };
+    const s = {
+        start() { if (!started) { started = true; chunk({ role: 'assistant' }); } },
+        delta(d) { if (!d) return; mark(); s.start(); chunk(d); },
+        tool(t) {
+            s.start();
+            if (t.id) {
+                const idx = ++toolIdx; curIdx = idx; byUp.set(t.id, idx);
+                if (t.upIndex !== undefined) byUp.set(t.upIndex, idx);
+                sentByIdx.set(idx, 0); ctx.hasTool = true; mark();
+                chunk({ tool_calls: [{ index: idx, id: t.id, type: 'function', function: { name: t.name || '', arguments: '' } }] });
+            } else if (t.argsDelta) {
+                const idx = (t.upIndex !== undefined && byUp.has(t.upIndex)) ? byUp.get(t.upIndex) : curIdx;
+                if (idx == null) return;
+                sentByIdx.set(idx, (sentByIdx.get(idx) || 0) + t.argsDelta.length);
+                chunk({ tool_calls: [{ index: idx, function: { arguments: t.argsDelta } }] });
+            }
+        },
+        toolSent() { return curIdx == null ? 0 : (sentByIdx.get(curIdx) || 0); },
+        error(msg) { try { send({ error: { message: msg, type: 'upstream_error' } }); } catch { } },
+        finalize(fr, usage) {
+            s.start();
+            chunk({}, fr || 'stop');
+            if (usage && Object.keys(usage).length) send({ id: ctx.id, object: 'chat.completion.chunk', created: ctx.created, model: ctx.model, choices: [], usage: usageToChat(usage) });
+            res.write('data: [DONE]\n\n');
+        },
+    };
+    return s;
+}
+
+// ---- sink: OpenAI Responses SSE（严格按官方事件顺序，Codex 依赖 content_part.added）----
+function responsesSink(res, ctx) {
+    const respId = 'resp_' + ctx.id.replace(/^chatcmpl-/, '');
+    const base = { id: respId, object: 'response', created_at: ctx.created, model: ctx.model };
+    const items = [];
+    let started = false, seq = 0, curIdx = null;
+    let reason = null, msg = null;
+    const byUp = new Map(), toolItems = new Map();
+    const mark = () => { if (ctx.ttft == null) ctx.ttft = Date.now() - ctx.t0; };
+    const ev = (type, o) => res.write(`event: ${type}\ndata: ${jdump({ type, ...o })}\n\n`);
+    const snap = (status) => ({ ...base, status, output: items.slice(), usage: null });
+    const ensure = () => { if (!started) { started = true; ev('response.created', { response: snap('in_progress') }); ev('response.in_progress', { response: snap('in_progress') }); } };
+    const closeReason = () => {
+        if (!reason || reason.closed) return;
+        reason.closed = true;
+        ev('response.reasoning_summary_text.done', { item_id: reason.id, output_index: reason.idx, summary_index: 0, text: reason.text });
+        ev('response.reasoning_summary_part.done', { item_id: reason.id, output_index: reason.idx, summary_index: 0, part: { type: 'summary_text', text: reason.text } });
+        const it = { id: reason.id, type: 'reasoning', summary: [{ type: 'summary_text', text: reason.text }] };
+        ev('response.output_item.done', { output_index: reason.idx, item: { ...it, status: 'completed' } });
+        items.push(it);
+    };
+    const closeMsg = () => {
+        if (!msg || msg.closed) return;
+        msg.closed = true;
+        ev('response.output_text.done', { item_id: msg.id, output_index: msg.idx, content_index: 0, text: msg.text });
+        ev('response.content_part.done', { item_id: msg.id, output_index: msg.idx, content_index: 0, part: { type: 'output_text', text: msg.text, annotations: [] } });
+        const it = { id: msg.id, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: msg.text, annotations: [] }] };
+        ev('response.output_item.done', { output_index: msg.idx, item: it });
+        items.push(it);
+    };
+    const s = {
+        start() { ensure(); },
+        delta(d) {
+            if (!d) return; ensure(); mark();
+            if (d.reasoning_content) {
+                if (!reason) {
+                    reason = { idx: seq++, id: randId('rs_'), text: '' };
+                    ev('response.output_item.added', { output_index: reason.idx, item: { id: reason.id, type: 'reasoning', summary: [] } });
+                    ev('response.reasoning_summary_part.added', { item_id: reason.id, output_index: reason.idx, summary_index: 0, part: { type: 'summary_text', text: '' } });
+                }
+                reason.text += d.reasoning_content;
+                ev('response.reasoning_summary_text.delta', { item_id: reason.id, output_index: reason.idx, summary_index: 0, delta: d.reasoning_content });
+            }
+            if (d.content) {
+                closeReason();
+                if (!msg) {
+                    msg = { idx: seq++, id: randId('msg_'), text: '' };
+                    ev('response.output_item.added', { output_index: msg.idx, item: { id: msg.id, type: 'message', status: 'in_progress', role: 'assistant', content: [] } });
+                    ev('response.content_part.added', { item_id: msg.id, output_index: msg.idx, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } });
+                }
+                msg.text += d.content;
+                ev('response.output_text.delta', { item_id: msg.id, output_index: msg.idx, content_index: 0, delta: d.content });
+            }
+        },
+        tool(t) {
+            ensure(); closeReason(); closeMsg(); mark();
+            if (t.id) {
+                const idx = seq++; curIdx = idx;
+                byUp.set(t.id, idx); if (t.upIndex !== undefined) byUp.set(t.upIndex, idx);
+                const item = { id: 'fc_' + crypto.randomBytes(12).toString('hex'), type: 'function_call', status: 'in_progress', call_id: t.id, name: t.name || '', arguments: '' };
+                toolItems.set(idx, item); ctx.hasTool = true;
+                ev('response.output_item.added', { output_index: idx, item: { ...item } });
+            } else if (t.argsDelta) {
+                const idx = (t.upIndex !== undefined && byUp.has(t.upIndex)) ? byUp.get(t.upIndex) : curIdx;
+                const item = idx != null ? toolItems.get(idx) : null;
+                if (!item) return;
+                item.arguments += t.argsDelta;
+                ev('response.function_call_arguments.delta', { item_id: item.id, output_index: idx, delta: t.argsDelta });
+            }
+        },
+        toolSent() { const it = curIdx != null ? toolItems.get(curIdx) : null; return it ? it.arguments.length : 0; },
+        error(m) { ensure(); ev('response.failed', { response: { ...base, status: 'failed', output: items.slice(), error: { message: m, code: 'upstream_error' } } }); },
+        finalize(fr, usage) {
+            ensure(); closeReason(); closeMsg();
+            for (const [idx, item] of toolItems) {
+                if (item.closed) continue;
+                item.closed = true;
+                const it = { id: item.id, type: 'function_call', status: 'completed', call_id: item.call_id, name: item.name, arguments: item.arguments || '{}' };
+                ev('response.function_call_arguments.done', { item_id: item.id, output_index: idx, arguments: it.arguments });
+                ev('response.output_item.done', { output_index: idx, item: it });
+                items.push(it);
+            }
+            ev('response.completed', { response: { ...base, status: 'completed', output: items.slice(), usage: usageToResponses(usage) } });
+        },
+    };
+    return s;
+}
+
+// ---- sink: Anthropic Messages SSE ----
+function messagesSink(res, ctx) {
+    const msgId = 'msg_' + ctx.id.replace(/^chatcmpl-/, '');
+    let started = false, seq = -1, curIdx = null;
+    let reason = null, text = null;
+    const byUp = new Map(), toolItems = new Map();
+    const mark = () => { if (ctx.ttft == null) ctx.ttft = Date.now() - ctx.t0; };
+    const ev = (type, o) => res.write(`event: ${type}\ndata: ${jdump({ type, ...o })}\n\n`);
+    const ensure = () => { if (!started) { started = true; ev('message_start', { message: { id: msgId, type: 'message', role: 'assistant', model: ctx.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }); } };
+    const closeReason = () => { if (reason && !reason.closed) { reason.closed = true; ev('content_block_stop', { index: reason.idx }); } };
+    const closeText = () => { if (text && !text.closed) { text.closed = true; ev('content_block_stop', { index: text.idx }); } };
+    const closeTools = () => { for (const [idx, it] of toolItems) if (!it.closed) { it.closed = true; ev('content_block_stop', { index: idx }); } };
+    const s = {
+        start() { ensure(); },
+        delta(d) {
+            if (!d) return; ensure(); mark();
+            if (d.reasoning_content) {
+                if (!reason) { reason = { idx: ++seq }; ev('content_block_start', { index: reason.idx, content_block: { type: 'thinking', thinking: '' } }); }
+                ev('content_block_delta', { index: reason.idx, delta: { type: 'thinking_delta', thinking: d.reasoning_content } });
+            }
+            if (d.content) {
+                closeReason();
+                if (!text) { text = { idx: ++seq }; ev('content_block_start', { index: text.idx, content_block: { type: 'text', text: '' } }); }
+                ev('content_block_delta', { index: text.idx, delta: { type: 'text_delta', text: d.content } });
+            }
+        },
+        tool(t) {
+            ensure(); closeReason(); closeText(); mark();
+            if (t.id) {
+                const idx = ++seq; curIdx = idx;
+                byUp.set(t.id, idx); if (t.upIndex !== undefined) byUp.set(t.upIndex, idx);
+                toolItems.set(idx, { idx, id: t.id, name: t.name || '', args: '' }); ctx.hasTool = true;
+                ev('content_block_start', { index: idx, content_block: { type: 'tool_use', id: t.id, name: t.name || '', input: {} } });
+            } else if (t.argsDelta) {
+                const idx = (t.upIndex !== undefined && byUp.has(t.upIndex)) ? byUp.get(t.upIndex) : curIdx;
+                const it = idx != null ? toolItems.get(idx) : null;
+                if (!it) return;
+                it.args += t.argsDelta;
+                ev('content_block_delta', { index: idx, delta: { type: 'input_json_delta', partial_json: t.argsDelta } });
+            }
+        },
+        toolSent() { const it = curIdx != null ? toolItems.get(curIdx) : null; return it ? it.args.length : 0; },
+        error(m) { ensure(); ev('error', { error: { type: 'api_error', message: m } }); },
+        finalize(fr, usage) {
+            ensure(); closeReason(); closeText(); closeTools();
+            const stop = fr === 'tool_calls' ? 'tool_use' : fr === 'length' ? 'max_tokens' : 'end_turn';
+            const u = usage || {};
+            ev('message_delta', { delta: { stop_reason: stop, stop_sequence: null }, usage: { input_tokens: u.in || 0, output_tokens: u.out || 0, cache_read_input_tokens: u.cached || 0 } });
+            ev('message_stop', {});
+        },
+    };
+    return s;
+}
+
+// ---- 上游流 → chat 事件（sink）----
+async function pumpResponses(upRes, ctx, sink) {   // responses SSE → sink（sseHandle 直接驱动 sink）
+    const reader = upRes.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (; ;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) ctx.up_res_bytes = (ctx.up_res_bytes || 0) + value.length;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+            const raw = buf.slice(0, i); buf = buf.slice(i + 2);
+            if (raw.trim()) sseHandle(raw, ctx, sink);
+        }
+    }
+    if (buf.trim()) sseHandle(buf, ctx, sink);
+}
+async function pumpMessages(upRes, ctx, sink) {    // Anthropic messages SSE → sink
+    const reader = upRes.body.getReader(); const dec = new TextDecoder();
+    let buf = '', cur = null, stopReason = 'end_turn';
     for (; ;) {
         const { done, value } = await reader.read(); if (done) break;
         if (value) ctx.up_res_bytes = (ctx.up_res_bytes || 0) + value.length;
@@ -1076,44 +1258,293 @@ async function relayMessages(upRes, res, ctx) {
             const line = raw.split('\n').find((l) => l.startsWith('data:'));
             if (!line) continue;
             let d; try { d = JSON.parse(line.slice(5).trim()); } catch { continue; }
-            if (d.type === 'message_start') { ctx.usage = usageFromMessages(d.message?.usage); start(); }
+            if (d.type === 'message_start') { ctx.usage = usageFromMessages(d.message?.usage); }
             else if (d.type === 'content_block_start') {
-                start();
                 const cb = d.content_block || {};
                 if (cb.type === 'tool_use') {
-                    toolIdx++; curTool = { idx: toolIdx, id: cb.id, name: cb.name, sent: 0 }; ctx.hasTool = true;
-                    chunk({ tool_calls: [{ index: toolIdx, id: cb.id, type: 'function', function: { name: cb.name, arguments: '' } }] });
-                    if (cb.input && typeof cb.input === 'object' && Object.keys(cb.input).length) {   // 少数上游直接给完整 input
-                        const s = jdump(cb.input); curTool.sent += s.length;
-                        chunk({ tool_calls: [{ index: curTool.idx, function: { arguments: s } }] });
-                    }
-                }
+                    cur = { id: cb.id, sent: 0 };
+                    sink.tool({ id: cb.id, name: cb.name || '', argsDelta: '' });
+                    if (cb.input && typeof cb.input === 'object' && Object.keys(cb.input).length) { const str = jdump(cb.input); cur.sent += str.length; sink.tool({ argsDelta: str }); }
+                } else if (cb.type === 'thinking' && cb.thinking) sink.delta({ reasoning_content: cb.thinking });
+                else if (cb.type === 'text' && cb.text) sink.delta({ content: cb.text });
             } else if (d.type === 'content_block_delta') {
                 const dl = d.delta || {};
-                if (dl.type === 'text_delta') { if (ttft == null) ttft = Date.now() - ctx.t0; chunk({ content: dl.text || '' }); }
-                else if (dl.type === 'thinking_delta') { if (ttft == null) ttft = Date.now() - ctx.t0; chunk({ reasoning_content: dl.thinking || '' }); }
-                else if (dl.type === 'input_json_delta' && curTool) {
-                    const p = dl.partial_json || '';
-                    if (p) { curTool.sent += p.length; chunk({ tool_calls: [{ index: curTool.idx, function: { arguments: p } }] }); }
-                }
+                if (dl.type === 'text_delta') sink.delta({ content: dl.text || '' });
+                else if (dl.type === 'thinking_delta') sink.delta({ reasoning_content: dl.thinking || '' });
+                else if (dl.type === 'input_json_delta' && cur) { const p = dl.partial_json || ''; if (p) { cur.sent += p.length; sink.tool({ argsDelta: p }); } }
             } else if (d.type === 'content_block_stop') {
-                // 兜底：整段参数没走过 delta 的话，stop 事件里的 content_block.input 可能就是全部
                 const cb = d.content_block || {};
-                if (curTool && curTool.sent === 0 && cb.type === 'tool_use' && cb.input && Object.keys(cb.input).length) {
-                    const s = jdump(cb.input); curTool.sent += s.length;
-                    chunk({ tool_calls: [{ index: curTool.idx, function: { arguments: s } }] });
-                }
+                if (cur && cur.sent === 0 && cb.type === 'tool_use' && cb.input && Object.keys(cb.input).length) { const str = jdump(cb.input); cur.sent += str.length; sink.tool({ argsDelta: str }); }
+                if (cb.type === 'tool_use') cur = null;
             } else if (d.type === 'message_delta') {
-                if (d.usage?.output_tokens != null) ctx.usage.out = d.usage.output_tokens;
+                if (d.usage?.output_tokens != null) { ctx.usage = ctx.usage || {}; ctx.usage.out = d.usage.output_tokens; }
+                if (d.usage?.input_tokens != null) { ctx.usage = ctx.usage || {}; ctx.usage.in = d.usage.input_tokens; }
                 if (d.delta?.stop_reason) stopReason = d.delta.stop_reason;
             } else if (d.type === 'error') ctx.upstreamError = d.error?.message || 'messages stream error';
         }
     }
-    start();
-    chunk({}, ctx.hasTool ? 'tool_calls' : (stopReason === 'max_tokens' ? 'length' : 'stop'));
-    if (Object.keys(ctx.usage).length) send({ id: ctx.id, object: 'chat.completion.chunk', created: ctx.created, model: ctx.model, choices: [], usage: usageToChat(ctx.usage) });
-    res.write('data: [DONE]\n\n');
-    if (ttft != null) ctx.ttft = ttft;
+    if (stopReason === 'tool_use') ctx.hasTool = true;
+    if (stopReason === 'max_tokens') ctx.finishReason = 'length';
+    ctx.stopReason = stopReason;
+}
+async function pumpChat(upRes, ctx, sink) {        // chat SSE → sink（转换路径用；chat→chat 仍走原样透传）
+    const reader = upRes.body.getReader(); const dec = new TextDecoder();
+    let buf = '', fr = null;
+    const handle = (payload) => {
+        if (!payload || payload === '[DONE]') return;
+        let d; try { d = JSON.parse(payload); } catch { return; }
+        if (d.usage) ctx.usage = usageFromChat(d.usage);
+        if (d.error) { ctx.upstreamError = d.error.message || 'upstream error'; return; }
+        const ch = d.choices && d.choices[0];
+        if (!ch) return;
+        const dl = ch.delta || {};
+        if (dl.content) sink.delta({ content: dl.content });
+        if (dl.reasoning_content) sink.delta({ reasoning_content: dl.reasoning_content });
+        if (Array.isArray(dl.tool_calls)) {
+            for (const tc of dl.tool_calls) {
+                if (tc.id) sink.tool({ id: tc.id, name: tc.function?.name || '', upIndex: tc.index });
+                if (tc.function && typeof tc.function.arguments === 'string' && tc.function.arguments) sink.tool({ argsDelta: tc.function.arguments, upIndex: tc.index });
+            }
+        }
+        if (ch.finish_reason) fr = ch.finish_reason;
+    };
+    for (; ;) {
+        const { done, value } = await reader.read(); if (done) break;
+        if (value) ctx.up_res_bytes = (ctx.up_res_bytes || 0) + value.length;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, i).replace(/\r$/, ''); buf = buf.slice(i + 1);
+            if (line.startsWith('data:')) handle(line.slice(5).trim());
+            else if (line.charAt(0) === '{') handle(line.trim());   // 有的中转站吐裸 JSON 行
+        }
+    }
+    if (buf.trim()) { const l = buf.replace(/\r$/, ''); if (l.startsWith('data:')) handle(l.slice(5).trim()); }
+    ctx.finishReason = fr;
+}
+
+// ---- 请求翻译：客户端协议 → chat ----
+function responsesToChatReq(body) {
+    const msgs = [];
+    const instr = typeof body.instructions === 'string' ? body.instructions
+        : Array.isArray(body.instructions) ? body.instructions.map((p) => p?.text ?? '').join('\n') : '';
+    if (instr) msgs.push({ role: 'system', content: instr });
+    const input = body.input;
+    const items = typeof input === 'string' ? [{ type: 'message', role: 'user', content: input }]
+        : Array.isArray(input) ? input : [];
+    let calls = [];
+    const flush = () => { if (calls.length) { msgs.push({ role: 'assistant', content: null, tool_calls: calls }); calls = []; } };
+    for (const it of items) {
+        if (!it || typeof it !== 'object') continue;
+        const t = it.type || (it.role ? 'message' : '');
+        if (t === 'function_call') {
+            calls.push({ id: it.call_id || it.id, type: 'function', function: { name: it.name || '', arguments: typeof it.arguments === 'string' ? it.arguments : jdump(it.arguments || {}) } });
+            continue;
+        }
+        flush();
+        if (t === 'function_call_output') {
+            msgs.push({ role: 'tool', tool_call_id: it.call_id, content: typeof it.output === 'string' ? it.output : jdump(it.output ?? '') });
+        } else if (t === 'reasoning') {
+            // chat 装不下 Responses 的推理项（加密 blob），丢弃
+        } else if (t === 'message' || it.role) {
+            const role = (it.role === 'developer' || it.role === 'system') ? 'system' : (it.role || 'user');
+            msgs.push({ role, content: textOf(it.content) });
+        }
+    }
+    flush();
+    const out = { model: body.model, messages: msgs, stream: !!body.stream };
+    if (body.max_output_tokens != null) out.max_tokens = body.max_output_tokens;
+    if (body.temperature != null) out.temperature = body.temperature;
+    if (body.top_p != null) out.top_p = body.top_p;
+    if (body.reasoning && typeof body.reasoning === 'object' && body.reasoning.effort != null) out.reasoning_effort = body.reasoning.effort;
+    if (body.metadata != null) out.metadata = body.metadata;
+    if (Array.isArray(body.tools) && body.tools.length) {
+        out.tools = body.tools.filter((t) => t && t.type === 'function').map((t) => ({
+            type: 'function',
+            function: { name: t.name || t.function?.name, description: t.description ?? t.function?.description, parameters: t.parameters || t.function?.parameters || { type: 'object', properties: {} } },
+        }));
+        if (body.tool_choice != null) out.tool_choice = normToolChoice(body.tool_choice);
+    }
+    return out;
+}
+function messagesToChatReq(body) {
+    const msgs = [];
+    const sys = typeof body.system === 'string' ? body.system
+        : Array.isArray(body.system) ? body.system.map((p) => p?.text ?? '').join('\n') : '';
+    if (sys) msgs.push({ role: 'system', content: sys });
+    for (const m of body.messages || []) {
+        if (!m || typeof m !== 'object') continue;
+        const role = m.role === 'assistant' ? 'assistant' : 'user';
+        if (typeof m.content === 'string') { msgs.push({ role, content: m.content }); continue; }
+        const parts = Array.isArray(m.content) ? m.content : [];
+        const texts = [], thinking = [], toolCalls = [], toolResults = [];
+        for (const p of parts) {
+            if (!p || typeof p !== 'object') continue;
+            if (p.type === 'text') texts.push(p.text || '');
+            else if (p.type === 'thinking') thinking.push(p.thinking || '');
+            else if (p.type === 'tool_use') toolCalls.push({ id: p.id, type: 'function', function: { name: p.name || '', arguments: typeof p.input === 'string' ? p.input : jdump(p.input || {}) } });
+            else if (p.type === 'tool_result') toolResults.push({ id: p.tool_use_id, content: textOf(p.content) });
+        }
+        if (toolResults.length) {              // Anthropic 把 tool_result 放在 user 消息里 → chat 要拆成独立 role:tool
+            for (const tr of toolResults) msgs.push({ role: 'tool', tool_call_id: tr.id, content: tr.content });
+            if (texts.length) msgs.push({ role, content: texts.join('') });
+            continue;
+        }
+        if (toolCalls.length) {
+            const msg = { role: 'assistant', content: texts.join('') || null, tool_calls: toolCalls };
+            if (thinking.length) msg.reasoning_content = thinking.join('\n');
+            msgs.push(msg);
+            continue;
+        }
+        if (thinking.length && role === 'assistant') { msgs.push({ role: 'assistant', content: texts.join('') || null, reasoning_content: thinking.join('\n') }); continue; }
+        msgs.push({ role, content: texts.join('') });
+    }
+    const out = { model: body.model, messages: msgs, stream: !!body.stream };
+    if (body.max_tokens != null) out.max_tokens = body.max_tokens;
+    if (body.temperature != null) out.temperature = body.temperature;
+    if (body.top_p != null) out.top_p = body.top_p;
+    if (body.stop_sequences != null) out.stop = body.stop_sequences;
+    if (Array.isArray(body.tools) && body.tools.length) {
+        out.tools = body.tools.filter((t) => t && (t.name || t.function)).map((t) => ({
+            type: 'function',
+            function: { name: t.name || t.function?.name, description: t.description ?? t.function?.description, parameters: t.input_schema || t.function?.parameters || { type: 'object', properties: {} } },
+        }));
+        if (body.tool_choice != null) out.tool_choice = normToolChoice(body.tool_choice, 'anthropic');
+    }
+    return out;
+}
+
+// ---- 响应渲染：chat JSON → 客户端协议 JSON（非流式）----
+function chatJsonToResponses(chat, ctx) {
+    const msg = (chat.choices && chat.choices[0] && chat.choices[0].message) || {};
+    const output = [];
+    if (msg.reasoning_content) output.push({ id: randId('rs_'), type: 'reasoning', summary: [{ type: 'summary_text', text: String(msg.reasoning_content) }] });
+    if (msg.content) output.push({ id: randId('msg_'), type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: String(msg.content), annotations: [] }] });
+    for (const tc of msg.tool_calls || []) output.push({ id: 'fc_' + crypto.randomBytes(12).toString('hex'), type: 'function_call', status: 'completed', call_id: tc.id, name: tc.function?.name || '', arguments: tc.function?.arguments || '{}' });
+    return {
+        id: 'resp_' + ctx.id.replace(/^chatcmpl-/, ''), object: 'response', created_at: ctx.created, status: 'completed', model: ctx.model,
+        output, output_text: String(msg.content || ''), usage: usageToResponses(ctx.usage),
+    };
+}
+function chatJsonToMessages(chat, ctx) {
+    const msg = (chat.choices && chat.choices[0] && chat.choices[0].message) || {};
+    const content = [];
+    if (msg.reasoning_content) content.push({ type: 'thinking', thinking: String(msg.reasoning_content) });
+    if (msg.content) content.push({ type: 'text', text: String(msg.content) });
+    for (const tc of msg.tool_calls || []) content.push({ type: 'tool_use', id: tc.id, name: tc.function?.name || '', input: safeJson(tc.function?.arguments) });
+    const fr = chat.choices && chat.choices[0] && chat.choices[0].finish_reason;
+    return {
+        id: 'msg_' + ctx.id.replace(/^chatcmpl-/, ''), type: 'message', role: 'assistant', model: ctx.model, content,
+        stop_reason: fr === 'tool_calls' ? 'tool_use' : fr === 'length' ? 'max_tokens' : 'end_turn', stop_sequence: null,
+        usage: { input_tokens: ctx.usage.in || 0, output_tokens: ctx.usage.out || 0, cache_read_input_tokens: ctx.usage.cached || 0 },
+    };
+}
+function renderJson(res, clientProto, chat, ctx) {
+    if (clientProto === 'chat') return sendJson(res, 200, chat);
+    if (clientProto === 'responses') return sendJson(res, 200, chatJsonToResponses(chat, ctx));
+    return sendJson(res, 200, chatJsonToMessages(chat, ctx));
+}
+
+// ---- 统一执行：候选协议探测 → 上游 → 按客户端协议渲染 ----
+async function serveChatPipeline(req, res, opts) {
+    const { auth, rt, t0, clientProto } = opts;
+    const body = opts.body;
+    const chatBody = clientProto === 'chat' ? body
+        : clientProto === 'responses' ? responsesToChatReq(body)
+            : messagesToChatReq(body);
+    const model = body.model, ip = clientIp(req);
+    const base = { ts: t0, key: auth.name, model, stream: !!body.stream, ip, cproto: clientProto, conv: convFingerprint(chatBody), req_bytes: Buffer.byteLength(opts.rawBody || ''), res_bytes: 0 };
+    countOut(res, base);
+    capture('client_req', { cproto: clientProto, ip, key: auth.name, model, stream: !!body.stream, body });
+    const ctx = { id: 'chatcmpl-' + crypto.randomBytes(10).toString('hex'), created: Math.floor(t0 / 1000), model, t0, provider: rt.provider, usage: {}, hasTool: false, ttft: null, reasonPending: [], reasonInj: 0 };
+    const sink = clientProto === 'chat' ? chatSink(res, ctx) : clientProto === 'responses' ? responsesSink(res, ctx) : messagesSink(res, ctx);
+    let status = 200, format = resolveFormat(rt), piped = false;
+    const hold = startFirstByteHold(res, !!body.stream);
+    try {
+        const ac = new AbortController();
+        const onClose = () => { if (!res.writableEnded) { try { ac.abort(); } catch { } } };
+        req.on('close', onClose);
+        let upRes, lastTxt = '';
+        for (const cand of protocolCandidates(rt)) {
+            format = cand;
+            const { url, payload, headers } = buildUpstream(rt, format, chatBody, auth.session_id, ctx);
+            capture('upstream_req', { candidate: cand, cproto: clientProto, url, key: auth.name, model, upstream_model: rt.upstream_model, payload });
+            const payloadStr = jdump(payload);
+            ctx.up_len = payloadStr.length;
+            ctx.pre4k = preHash(payloadStr, 4096); ctx.pre16k = preHash(payloadStr, 16384); ctx.pre64k = preHash(payloadStr, 65536);
+            upRes = await fetch(url, { method: 'POST', headers, body: payloadStr, signal: ac.signal });
+            capture('upstream_status', { candidate: cand, status: upRes.status, ok: upRes.ok });
+            if (upRes.ok) break;
+            lastTxt = await upRes.text(); status = upRes.status;
+            const auto = !rt.format || rt.format === 'auto';
+            if (auto && protocolMismatch(status, lastTxt)) { log('PROTOCOL SWITCH', rt.provider, rt.upstream_model, `${format} 不支持, 试下一个`, `(${status})`); continue; }
+            break;
+        }
+        req.off('close', onClose);
+        if (upRes.ok) { const fk = rt.provider + '|' + rt.upstream_model; if ((!rt.format || rt.format === 'auto') && FORMAT_OVERRIDES[fk] !== format) { FORMAT_OVERRIDES[fk] = format; saveOverrides(); } }
+        if (!upRes.ok) {
+            let parsed = null; try { parsed = JSON.parse(lastTxt); } catch { }
+            log('UPSTREAM ERROR', status, rt.provider, format, model, lastTxt.slice(0, 300));
+            if (hold.sent) {   // 保活已提前发出 200 响应头 → 改发 SSE 错误事件收尾
+                record({ ...base, status, ms: Date.now() - t0, provider: rt.provider, upstream_model: rt.upstream_model, format, error: lastTxt.slice(0, 500) });
+                log('HOLD-ERROR', `上游 ${status} 且已提前开流，改发 SSE 错误事件`);
+                sink.error(parsed?.error?.message || lastTxt.slice(0, 800) || 'upstream error');
+                sink.finalize('stop', {});
+                return res.end();
+            }
+            record({ ...base, status, ms: Date.now() - t0, provider: rt.provider, upstream_model: rt.upstream_model, format, error: lastTxt.slice(0, 500) });
+            return sendJson(res, status, parsed?.error ? { error: parsed.error } : { error: { message: lastTxt.slice(0, 800) || 'upstream error', type: 'upstream_error' } });
+        }
+        if (body.stream) hold.open();
+        if (format === 'responses') {
+            if (body.stream) { if (!res.headersSent) res.writeHead(200, SSE_HEADERS); await pumpResponses(upRes, ctx, sink); }
+            else { const d = await upRes.json(); renderJson(res, clientProto, responsesToChatJson(d, ctx), ctx); }
+        } else if (format === 'messages') {
+            if (body.stream) { if (!res.headersSent) res.writeHead(200, SSE_HEADERS); await pumpMessages(upRes, ctx, sink); }
+            else { const d = await upRes.json(); renderJson(res, clientProto, messagesToChatJson(d, ctx), ctx); }
+        } else if (body.stream) {
+            if (!res.headersSent) res.writeHead(200, SSE_HEADERS);
+            if (clientProto === 'chat') {                 // chat→chat：原样字节透传（保持既有行为）
+                const reader = upRes.body.getReader(); const dec = new TextDecoder(); let buf = '', ttft = 0;
+                for (; ;) {
+                    const { done, value } = await reader.read(); if (done) break;
+                    if (value) ctx.up_res_bytes = (ctx.up_res_bytes || 0) + value.length;
+                    if (!ttft) ttft = Date.now() - t0;
+                    const text = dec.decode(value, { stream: true });
+                    buf += text;
+                    for (const mm of [...buf.matchAll(/data:\s*(\{.*?\})\s*\n/g)]) { try { const j = JSON.parse(mm[1]); if (j.usage) ctx.usage = usageFromChat(j.usage); if (j.choices?.[0]?.delta?.tool_calls) ctx.hasTool = true; } catch { } }
+                    res.write(value);
+                }
+                res.end(); ctx.ttft = ttft; piped = true;
+            } else {
+                await pumpChat(upRes, ctx, sink);
+            }
+        } else {
+            const d = await upRes.json();
+            ctx.usage = usageFromChat(d.usage);
+            ctx.up_res_bytes = Buffer.byteLength(jdump(d));
+            renderJson(res, clientProto, d, ctx);
+        }
+        if (body.stream && !piped) {
+            if (ctx.upstreamError && ctx.ttft == null) { log('UPSTREAM STREAM ERROR', ctx.upstreamError); sink.error(ctx.upstreamError); }
+            sink.finalize(finishOf(ctx), ctx.usage);
+            if (!res.writableEnded) res.end();
+        }
+        record({ ...base, status, ms: Date.now() - t0, provider: rt.provider, upstream_model: rt.upstream_model, format, usage: ctx.usage, ttft_ms: ctx.ttft || 0, has_tool: ctx.hasTool, reason_inj: ctx.reasonInj || 0, up_len: ctx.up_len, up_res_bytes: ctx.up_res_bytes || 0, pre4k: ctx.pre4k, pre16k: ctx.pre16k, pre64k: ctx.pre64k });
+        log('OK', clientProto + '->' + format, rt.upstream_model, `in=${ctx.usage.in || 0} out=${ctx.usage.out || 0} cached=${ctx.usage.cached || 0}`, `${Date.now() - t0}ms`);
+    } catch (e) {
+        hold.stop();
+        if (e.name === 'AbortError') {
+            log('CLIENT ABORT', model, `${Date.now() - t0}ms`);
+            record({ ...base, status: 499, ms: Date.now() - t0, provider: rt.provider, error: 'client aborted' });
+            try { res.end(); } catch { }
+            return;
+        }
+        log('GATEWAY ERROR', e.message);
+        record({ ...base, status: 500, ms: Date.now() - t0, provider: rt.provider, error: e.message });
+        if (!res.headersSent) sendJson(res, 500, { error: { message: e.message, type: 'gateway_error' } });
+        else try { res.end(); } catch { }
+    }
 }
 
 // ---------------- 拉取上游模型列表 ----------------
@@ -1190,7 +1621,7 @@ function configView() {
         providers,
         routes: (CFG.routes || []).map((r) => ({ model_regex: r.model_regex, provider: r.provider, strip: r.strip || '', format: r.format || 'auto' })),
         models,
-        keys: (CFG.keys || []).map((k) => ({ name: k.name, protocol: k.protocol || '' })),
+        keys: (CFG.keys || []).map((k) => ({ name: k.name, protocol: k.protocol || '', interop: !!k.protocol_interop })),
         formats: Object.keys(CFG.model_formats || {}).length,
         listen: CFG.listen,
         dashboard_hosts: (CFG.dashboard_auth || {}).hosts || [],
@@ -1359,6 +1790,15 @@ function applyConfigChange(p, b) {
         saveConfig(cfg); reloadConfig();
         log('CONFIG key protocol', name, proto || '(自动)');
         return { key: name, protocol: proto };
+    }
+    if (p === '/api/config/key/interop') {            // 协议互转（实验性，按 key，默认关）：允许该 key 的 responses/messages 客户端跨协议用其它协议的模型
+        const name = String(b.name || '').trim();
+        const k = (cfg.keys || []).find((x) => x.name === name);
+        if (!k) throw new Error('key 不存在: ' + name);
+        if (b.enabled) k.protocol_interop = true; else delete k.protocol_interop;
+        saveConfig(cfg); reloadConfig();
+        log('CONFIG key interop', name, b.enabled ? 'ON' : 'OFF');
+        return { key: name, interop: !!k.protocol_interop };
     }
     if (p === '/api/config/toggle') {
         cfg.enabled = b.enabled !== false;
@@ -1541,10 +1981,12 @@ const server = http.createServer(async (req, res) => {
         const want = String(url.searchParams.get('protocol') || '').toLowerCase();
         const bound = String(mA.protocol || '').toLowerCase();
         const isAnthropic = !!req.headers['anthropic-version'];
+        // 协议互转开启后每种客户端都能用每种模型；置 config.json 的 model_filter_protocol = false 即对所有客户端展示全量
         const only = ['chat', 'responses', 'messages'].includes(want) ? want
-            : ['chat', 'responses', 'messages'].includes(bound) ? bound
-                : isAnthropic ? 'messages'
-                    : (keyProtocolHint(mA.name) === 'chat' ? null : keyProtocolHint(mA.name));   // 最近用 chat = 不过滤
+            : CFG.model_filter_protocol === false ? null
+                : ['chat', 'responses', 'messages'].includes(bound) ? bound
+                    : isAnthropic ? 'messages'
+                        : (keyProtocolHint(mA.name) === 'chat' ? null : keyProtocolHint(mA.name));   // 最近用 chat = 不过滤
         const entries = (CFG.models || []).map((m) => {
             const { protocol, detected } = modelProtocol(m);
             return { id: m, protocol, detected };
@@ -1674,6 +2116,13 @@ const server = http.createServer(async (req, res) => {
         const pBase = { ts: t0, key: pAuth.name, model: pBody.model, stream: !!pBody.stream, ip: clientIp(req), passthrough: true, conv: convFingerprint(pBody), req_bytes: Buffer.byteLength(pRaw || ''), res_bytes: 0, up_res_bytes: 0 };
         countOut(res, pBase);
         if (!pRt) { record({ ...pBase, status: 400, ms: Date.now() - t0, provider: null }); return sendJson(res, 400, { error: { message: `model "${pBody.model}" not routed`, type: 'invalid_request_error' } }); }
+        // 协议互转（按 key 开关 keys[].protocol_interop，默认关；看板「客户端 key」页可勾）：开启时
+        // 「上游协议 != 客户端协议」走 chat 中枢互转；关闭时一律走下面的原生直通，由上游报协议不支持。
+        const upFmt = resolveFormat(pRt);
+        if (upFmt !== kind && pAuth.interop) {
+            log('CONVERT', kind, '->', upFmt, pBody.model);
+            return serveChatPipeline(req, res, { auth: pAuth, rt: pRt, body: pBody, rawBody: pRaw, t0, clientProto: kind });
+        }
         const pHeaders = upstreamHeaders(pRt.providerCfg, pAuth.session_id, pBody.stream ? 'text/event-stream' : 'application/json', kind);
         for (const hn of Object.keys(req.headers)) {                 // 把客户端的协议头原样带上去（anthropic-beta / openai-beta / x-stainless-*）
             if (/^(anthropic-|openai-beta|x-stainless)/i.test(hn)) pHeaders[hn] = String(req.headers[hn]);
@@ -1796,126 +2245,12 @@ const server = http.createServer(async (req, res) => {
     let body;
     let rawBody = '';
     try { rawBody = await readBody(req); body = JSON.parse(rawBody); } catch { return sendJson(res, 400, { error: { message: 'invalid json body', type: 'invalid_request_error' } }); }
-    const model = body.model;
-    capture('client_req', { ip: clientIp(req), key: auth.name, model, stream: !!body.stream, n_messages: Array.isArray(body.messages) ? body.messages.length : null, body });
-    const rt = routeFor(model);
-    const base = { ts: t0, key: auth.name, model, stream: !!body.stream, ip: clientIp(req), conv: convFingerprint(body), req_bytes: Buffer.byteLength(rawBody || ''), res_bytes: 0 };
-    countOut(res, base);
-    if (!rt) { record({ ...base, status: 400, ms: Date.now() - t0, provider: null }); return sendJson(res, 400, { error: { message: `model "${model}" not routed`, type: 'invalid_request_error' } }); }
-
-    const ctx = {
-        id: 'chatcmpl-' + crypto.randomBytes(10).toString('hex'), created: Math.floor(t0 / 1000),
-        model, t0, provider: rt.provider, usage: {}, hasTool: false, ttft: 0, reasonPending: [], reasonInj: 0,
-    };
-    let status = 200;
-    let format = resolveFormat(rt);
-    const hold = startFirstByteHold(res, !!body.stream);   // 上游首字节慢时提前开流（防 CF 524 静默超时）
-    try {
-        const ac = new AbortController();
-        const onClose = () => { if (!res.writableEnded) { try { ac.abort(); } catch { } } };
-        req.on('close', onClose);
-        let upRes, lastTxt = '';
-        const candidates = protocolCandidates(rt);
-        for (const cand of candidates) {
-            format = cand;
-            const { url, payload, headers } = buildUpstream(rt, format, body, auth.session_id, ctx);
-            capture('upstream_req', { candidate: cand, url, key: auth.name, model, upstream_model: rt.upstream_model, payload });
-            const payloadStr = jdump(payload);
-            if (ctx) {   // 前缀指纹：同一会话相邻请求若哈希变了＝我方让前缀不一致；没变却 0 命中＝上游/中转站自己没复用
-                ctx.up_len = payloadStr.length;
-                ctx.pre4k = preHash(payloadStr, 4096);
-                ctx.pre16k = preHash(payloadStr, 16384);
-                ctx.pre64k = preHash(payloadStr, 65536);
-            }
-            upRes = await fetch(url, { method: 'POST', headers, body: payloadStr, signal: ac.signal });
-            capture('upstream_status', { candidate: cand, status: upRes.status, ok: upRes.ok });
-            if (upRes.ok) break;
-            lastTxt = await upRes.text();
-            status = upRes.status;
-            const auto = !rt.format || rt.format === 'auto';
-            if (auto && protocolMismatch(status, lastTxt)) { log('PROTOCOL SWITCH', rt.provider, rt.upstream_model, `${format} 不支持, 试下一个`, `(${status})`); continue; }
-            break;
-        }
-        req.off('close', onClose);
-        if (upRes.ok) {
-            const fk = rt.provider + '|' + rt.upstream_model;
-            if ((!rt.format || rt.format === 'auto') && FORMAT_OVERRIDES[fk] !== format) { FORMAT_OVERRIDES[fk] = format; saveOverrides(); }
-        }
-        if (!upRes.ok) {
-            let parsed = null; try { parsed = JSON.parse(lastTxt); } catch { }
-            log('UPSTREAM ERROR', status, rt.provider, format, model, lastTxt.slice(0, 300));
-            if (hold.sent) {   // 保活已提前发出 200 响应头 → HTTP 状态码改不了，改用 SSE 错误事件 + [DONE] 收尾
-                record({ ...base, status, ms: Date.now() - t0, provider: rt.provider, upstream_model: rt.upstream_model, format, error: lastTxt.slice(0, 500) });
-                log('HOLD-ERROR', `上游 ${status} 且已提前开流，改发 SSE 错误事件`);
-                try {
-                    res.write(`data: ${JSON.stringify({ error: parsed?.error || { message: lastTxt.slice(0, 800) || 'upstream error', type: 'upstream_error' } })}\n\n`);
-                    res.write('data: [DONE]\n\n');
-                } catch { }
-                return res.end();
-            }
-            record({ ...base, status, ms: Date.now() - t0, provider: rt.provider, upstream_model: rt.upstream_model, format, error: lastTxt.slice(0, 500) });
-            return sendJson(res, status, parsed?.error ? { error: parsed.error } : { error: { message: lastTxt.slice(0, 800) || 'upstream error', type: 'upstream_error' } });
-        }
-
-        if (body.stream) hold.open();      // 流式：客户端流即将打开 → 起心跳（幂等），直到第一块真实数据写出
-        if (format === 'responses') {
-            if (body.stream) {
-                if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
-                await relayResponses(upRes, res, ctx);
-                res.end();
-            } else {
-                const d = await upRes.json();
-                const out = responsesToChatJson(d, ctx);
-                sendJson(res, 200, out);
-            }
-        } else if (format === 'messages') {
-            if (body.stream) {
-                if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
-                await relayMessages(upRes, res, ctx);
-                res.end();
-            } else {
-                const d = await upRes.json();
-                sendJson(res, 200, messagesToChatJson(d, ctx));
-            }
-        } else {
-            if (body.stream) {
-                if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
-                const reader = upRes.body.getReader(); const dec = new TextDecoder(); let buf = '', ttft = 0;
-                for (; ;) {
-                    const { done, value } = await reader.read(); if (done) break;
-                    if (value) ctx.up_res_bytes = (ctx.up_res_bytes || 0) + value.length;
-                    if (!ttft) ttft = Date.now() - t0;
-                    const text = dec.decode(value, { stream: true });
-                    buf += text;
-                    // 抓 usage
-                    const m = [...buf.matchAll(/data:\s*(\{.*?\})\s*\n/g)];
-                    for (const mm of m) { try { const j = JSON.parse(mm[1]); if (j.usage) ctx.usage = usageFromChat(j.usage); if (j.choices?.[0]?.delta?.tool_calls) ctx.hasTool = true; } catch { } }
-                    res.write(value);
-                }
-                res.end();
-                ctx.ttft = ttft;
-            } else {
-                const d = await upRes.json();
-                ctx.usage = usageFromChat(d.usage);
-                ctx.up_res_bytes = Buffer.byteLength(jdump(d));
-                sendJson(res, 200, d);
-            }
-        }
-        record({ ...base, status, ms: Date.now() - t0, provider: rt.provider, upstream_model: rt.upstream_model, format, usage: ctx.usage, ttft_ms: ctx.ttft || 0, has_tool: ctx.hasTool, reason_inj: ctx.reasonInj || 0, up_len: ctx.up_len, up_res_bytes: ctx.up_res_bytes || 0, pre4k: ctx.pre4k, pre16k: ctx.pre16k, pre64k: ctx.pre64k });
-        log('OK', format, rt.upstream_model, `in=${ctx.usage.in || 0} out=${ctx.usage.out || 0} cached=${ctx.usage.cached || 0}`, `${Date.now() - t0}ms`);
-    } catch (e) {
-        hold.stop();
-        if (e.name === 'AbortError') {
-            log('CLIENT ABORT', model, `${Date.now() - t0}ms`);
-            record({ ...base, status: 499, ms: Date.now() - t0, provider: rt.provider, error: 'client aborted' });
-            try { res.end(); } catch { }
-            return;
-        }
-        log('GATEWAY ERROR', e.message);
-        record({ ...base, status: 500, ms: Date.now() - t0, provider: rt.provider, error: e.message });
-        if (!res.headersSent) sendJson(res, 500, { error: { message: e.message, type: 'gateway_error' } });
-        else try { res.end(); } catch { }
+    const rt = routeFor(body.model);
+    if (!rt) {
+        record({ ts: t0, key: auth.name, model: body.model, stream: !!body.stream, ip: clientIp(req), cproto: 'chat', req_bytes: Buffer.byteLength(rawBody || ''), status: 400, ms: Date.now() - t0, provider: null });
+        return sendJson(res, 400, { error: { message: `model "${body.model}" not routed`, type: 'invalid_request_error' } });
     }
+    return serveChatPipeline(req, res, { auth, rt, body, rawBody, t0, clientProto: 'chat' });
 });
 
 const { host = '0.0.0.0', port = 8010 } = CFG.listen || {};

@@ -6,22 +6,44 @@
 
 ## 它做什么
 
+客户端说一种协议，上游说另一种，网关负责把它们对上：
+
 | 客户端 → ＼ 上游 ↓ | chat | responses | messages |
 |---|---|---|---|
 | **chat**（`/v1/chat/completions`） | ✅ 原样透传 | ✅ 双向翻译 | ✅ 双向翻译 |
-| **responses**（`/v1/responses`） | ❌ | ✅ 原样直通 | ❌ |
-| **messages**（`/v1/messages`） | ❌ | ❌ | ✅ 原样直通 |
+| **responses**（`/v1/responses`） | ⚙️ 可选 | ✅ 原样直通 | ⚙️ 可选 |
+| **messages**（`/v1/messages`） | ⚙️ 可选 | ⚙️ 可选 | ✅ 原样直通 |
+
+**chat 是中枢**：客户端只要说 chat，就能用任意协议的上游。responses / messages 原生客户端（Codex、Claude Code 这类）默认只能同协议直通；`⚙️ 可选` 那几格要开「协议互转」——**默认关**，见下。
 
 | 能力 | 说明 |
 |---|---|
 | 路由 | 按模型名前缀或正则分流到不同上游，可 `strip` 掉前缀 |
 | 三协议 | 默认自动试，成功后记忆协议类型 |
+| 协议互转（可选） | **默认关**，按 key 勾选：让 responses / messages 客户端跨协议用其它协议的模型。会丢保真度，见下 |
 | 虚拟 key | 每个客户端一把，可选绑定协议、可吊销、单独统计 |
 | 统计 | 每条请求落 SQLite：token / 缓存命中 / TTFT / 耗时 / 字节 / 调用方 IP / 状态 |
 | 面板 | 单页 HTML、无构建：用量统计（多时间口径）、模型列表、加供应商、客户端 key；暗亮主题、手机适配 |
 | 抓包开关 | 一键把「客户端原始请求体」和「翻译后发给上游的 payload」并排落盘——判锅用 |
 | 首字节保活 | 上游迟迟不吐数据时，先开 SSE 流并每 10s 发注释心跳，绕开反代的 120s 超时 |
 | 推理链回灌 | 把 reasoning item 按 `call_id` 归档并插回下一轮，多轮工具调用不再丢思维链 |
+
+## 协议互转（可选，默认关）
+
+> 留着这个功能是因为「总觉得应该有」，但它本质是**围绕 chat 做的中枢式转换**，不是无损互通。除非你真的需要「messages 客户端跑 responses 上游的模型」这种组合，否则别开。
+
+**打开**：面板「客户端 key」页 → 每个 key 一列「协议互转」勾选框（默认关）。开的是**那一个 key**，其它 key 不受影响；对应 `config.json` 里 `keys[].protocol_interop`。
+
+| | |
+|---|---|
+| 做什么 | 上游协议 ≠ 客户端协议时走 `客户端协议 → chat → 上游协议`，响应再翻回来。请求侧 `responsesToChatReq` / `messagesToChatReq`；响应侧按客户端协议渲染 Responses / Anthropic 事件流（`responsesSink` / `messagesSink`） |
+| 同协议 | **不受影响**，仍走原生直通（逐字节回吐，保真度最高） |
+| 保真度代价 | ① Responses 的加密 reasoning item 在 chat 中枢里装不下 → 丢；② Anthropic 流式的 `message_start.usage.input_tokens` 只能给 0（真值补在 `message_delta`）；③ 图片块被忽略 |
+| 模型可见性 | `/v1/models` 默认仍按客户端协议过滤；置 `config.json` 的 `model_filter_protocol: false` 可放开成全量 |
+| 排查 | 互转请求打 `CONVERT <客户端协议> -> <上游协议>`；统计表新增 `cproto` 字段（客户端协议） |
+| 回归 | `scripts/interop_test/run.sh` —— 起假上游 + 第二个网关实例，跑 3 客户端 × 3 上游 × 流式/非流式 + 多轮工具回传 |
+
+改这段代码时**必须守住**：Responses 事件顺序里 `response.content_part.added` 不能漏——漏了 Codex 会报 `OutputTextDelta without active item` 并**丢弃全部正文**，而 HTTP 仍是 200、流也合法，最难查。
 
 ## 跑起来
 
@@ -41,7 +63,7 @@ node server.mjs                       # 或 docker compose up -d
 - 上游额度卡片默认是空的（`config.quota` 不填就不显示）；返回形状各家不同，改 `upstreamBalance()` / `upstreamUsage()` 两个函数。
 - 反代后面要关掉响应缓冲，否则流式会被攒成一坨再吐。
 - 面板挂公网默认单步验证（`config.dashboard_auth.hosts`）。
-- `responses`-`messages`没做互转。
+- `responses`-`messages` 的互转是**可选且默认关**的（面板 key 页勾选），会丢保真度——见上面「协议互转」。
 
 ## 目录
 
@@ -52,6 +74,7 @@ config.example.json     配置模板
 .env.example            上游 key 模板
 docker-compose.yml
 scripts/smoke_test.py   冒烟脚本
+scripts/interop_test/   协议互转矩阵回归（假上游 + 第二实例）
 ```
 
 MIT

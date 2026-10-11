@@ -1053,16 +1053,25 @@ async function renderKeys() {
   if (!CONF) return;
   let st = {};
   try { st = (await api('/api/stats')).by_key || {}; } catch { }
-  table($('tbl_keys'), ['key', 'key 值', '协议', '请求', '输入', '输出', '字节(↑/↓)', '命中', '操作'],
+  table($('tbl_keys'), ['key', 'key 值', '协议', '协议互转', '请求', '输入', '输出', '字节(↑/↓)', '命中', '操作'],
     CONF.keys.map(k => { const v = st[k.name] || {};
       return [esc(k.name),
         `<span data-keycell="${esc(k.name)}" class="dim" style="word-break:break-all">sk-gw-••••••••••••</span>`,
         `<select data-kproto="${esc(k.name)}">` + ['', 'chat', 'responses', 'messages'].map(p =>
           `<option value="${p}"${(k.protocol || '') === p ? ' selected' : ''}>${p || '自动'}</option>`).join('') + '</select>',
+        `<label title="协议互转（实验性，默认关）：允许该 key 的 responses / messages 客户端跨协议使用其它协议的模型（走 chat 中枢互转）。&#10;代价：互转会丢原生保真度——加密推理链、图片块会被丢，Anthropic 流式的 input_tokens 只能补在 message_delta。&#10;同协议请求不受影响（仍走原生直通）。" style="display:flex;gap:6px;align-items:center;justify-content:center;cursor:help"><input type="checkbox" data-kint="${esc(k.name)}" style="width:auto"${k.interop ? ' checked' : ''}><span class="dim" style="font-size:calc(var(--fs)*0.8)">${k.interop ? '开' : '关'}</span></label>`,
         fmt(v.requests || 0), fmt(v.in || 0), fmt(v.out || 0), `${fmtB(v.bytes_in)} / ${fmtB(v.bytes_out)}`, hitCell(v),
         `<button class="act" data-rev="${esc(k.name)}">显示</button> ` +
         `<button class="act" data-copy="${esc(k.name)}">复制</button> ` +
         `<button class="act danger" data-delk="${esc(k.name)}">删除</button>`]; }), '还没有 key', null, [1]);
+  document.querySelectorAll('[data-kint]').forEach(c => c.onchange = async () => {
+    try {
+      const r = await api('/api/config/key/interop', { name: c.dataset.kint, enabled: c.checked });
+      CONF = r.config;
+      toast(`key ${r.key} 的协议互转：${r.interop ? '已开启（跨协议可用其它协议的模型）' : '已关闭'}`);
+      renderKeys();
+    } catch (e) { c.checked = !c.checked; toast('失败：' + e.message, 1); }
+  });
   document.querySelectorAll('[data-kproto]').forEach(s => s.onchange = async () => {
     try {
       const r = await api('/api/config/key/protocol', { name: s.dataset.kproto, protocol: s.value });
