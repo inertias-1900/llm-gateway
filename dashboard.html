@@ -103,6 +103,11 @@
   .hint{color:var(--dim2);font-size:calc(var(--fs)*0.84)}
   .msg{padding:8px 0;color:var(--dim2)}
   .pill{border:1px solid var(--line);padding:1px 7px;font-size:calc(var(--fs)*0.78);color:var(--dim2)}
+  /* 「入/出」格：上行 token，下行协议（小一号）。高度锁死＝原单行高（td 字号 0.9×--fs、行高 1.55），
+     所以两行也不会撑高行——实测行高与单行版一致（31.92px）。 */
+  .tcell{display:flex;flex-direction:column;justify-content:center;height:calc(var(--fs)*0.9*1.55);
+    line-height:1.0;font-size:calc(var(--fs)*0.76)}
+  .tcell .p{font-size:calc(var(--fs)*0.62);color:var(--dim2)}
   .hidden{display:none !important}
   code{color:var(--cyan);word-break:break-all}
   .gwtoggle{background:var(--btn);border:1px solid var(--line);color:var(--dim2);font:inherit;
@@ -176,6 +181,9 @@
     .filtergrid{grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:6px 8px}
     .filtergrid label>select,.filtergrid label>input{min-width:0}
     .filters .act{padding:6px 10px;font-size:calc(var(--fs)*0.85)}
+    /* 卡片式下 td 已是 flex 行，固定高度没必要且会撑卡片 → 复位 */
+    .tcell{height:auto;line-height:1.15;font-size:calc(var(--fs)*0.82)}
+    .tcell .p{font-size:calc(var(--fs)*0.68)}
   }
   @media (max-width:430px){
     .grid4,.grid3{grid-template-columns:1fr}
@@ -338,6 +346,7 @@
             <button class="act" data-range="all">全部</button>
             <span class="hint" id="f_info"></span>
           </div>
+          <div class="hint" style="padding:0 10px 6px">「入/出」格下行是两个协议：<b>入站</b>＝客户端发给网关用的协议，<b>出站</b>＝网关发给上游用的协议；两者不同 = 该请求走了协议互转（日志里的 CONVERT）。2026-10-11 之前的旧记录没有入站协议字段，按直通标记推断。</div>
           <div style="padding:0 6px 6px"><div class="tblwrap"><table id="tbl_recent"></table></div></div>
           <div class="pager">
             <button class="act" data-page="first">« 首页</button>
@@ -773,18 +782,30 @@ async function refreshStats() {
 
 /* ---------- 最近请求：筛选 + 查询历史 ---------- */
 const REQ_HEAD = ['时间', 'IP', 'key', '模型', '状态', 'TTFT/总耗时', '入/出', '字节(↑请求 ↓响应)', '命中', '工具'];
+const PROTO_ABBR = { chat: 'chat', responses: 'resp', messages: 'msg' };
+const PROTO_FULL = { chat: 'chat — OpenAI Chat Completions', responses: 'responses — OpenAI Responses', messages: 'messages — Anthropic Messages' };
+// 入站协议：cproto 是实采的；旧记录（2026-10-11 前没有该字段）按 passthrough 推断——
+// 直通路的入站协议 == 上游协议，其余走的是 chat 入口。
+const inProto = (r) => r.cproto || (r.passthrough ? r.format : 'chat');
+const protoTxt = (p) => p ? (PROTO_ABBR[p] || p) : '-';
+const protoTip = (p, side) => side + '：' + (p ? (PROTO_FULL[p] || p) : '该记录没采集到协议');
 function renderReqRows(items) {
-  table($('tbl_recent'), REQ_HEAD, items.map(r => [
-    new Date(r.ts).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }),
-    `<span class="dim">${esc(r.ip || '-')}</span>`, esc(r.key),
-    esc(r.model) + ((r.model && r.upstream_model && !String(r.model).endsWith('/' + r.upstream_model))   // 上游名通常＝模型名去掉前缀，只有真别名时才附上
-      ? ` <span class="dim">→ ${esc(r.upstream_model)}</span>` : ''),
-    r.status >= 400 ? `<span class="red">${r.status}</span>` : `<span class="green">${r.status}</span>`,
-    `${ms(r.ttft_ms)} / ${ms(r.ms)}`,
-    `${fmt(r.usage?.in || 0)} / ${fmt(r.usage?.out || 0)}`,
-    `<span class="cyan">${fmtB(r.req_bytes)}</span> <span class="dim">/</span> <span class="amber">${fmtB(r.up_res_bytes)}</span>`,
-    hitCell(r.usage, r),
-    r.has_tool ? '<span class="violet">✓</span>' : '']), '没有匹配的请求', null, [[1, 13], [3, 30], [7, 22]], 0);
+  table($('tbl_recent'), REQ_HEAD, items.map(r => {
+    const ip = inProto(r), op = r.format;
+    return [
+      new Date(r.ts).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      `<span class="dim">${esc(r.ip || '-')}</span>`, esc(r.key),
+      esc(r.model) + ((r.model && r.upstream_model && !String(r.model).endsWith('/' + r.upstream_model))   // 上游名通常＝模型名去掉前缀，只有真别名时才附上
+        ? ` <span class="dim">→ ${esc(r.upstream_model)}</span>` : ''),
+      r.status >= 400 ? `<span class="red">${r.status}</span>` : `<span class="green">${r.status}</span>`,
+      `${ms(r.ttft_ms)} / ${ms(r.ms)}`,
+      `<span class="tcell" title="${esc(protoTip(ip, '入站（客户端 → 网关）'))}&#10;${esc(protoTip(op, '出站（网关 → 上游）'))}">` +
+      `<span>${fmt(r.usage?.in || 0)} / ${fmt(r.usage?.out || 0)}</span>` +
+      `<span class="p">${esc(protoTxt(ip))} / ${esc(protoTxt(op))}</span></span>`,
+      `<span class="cyan">${fmtB(r.req_bytes)}</span> <span class="dim">/</span> <span class="amber">${fmtB(r.up_res_bytes)}</span>`,
+      hitCell(r.usage, r),
+      r.has_tool ? '<span class="violet">✓</span>' : ''];
+  }), '没有匹配的请求', null, [[1, 13], [3, 30], [7, 22]], 0);
 }
 function dtLocalStr(ms) {
   const d = new Date(ms), p = (n) => String(n).padStart(2, '0');
