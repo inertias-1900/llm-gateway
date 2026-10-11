@@ -17,6 +17,18 @@
 | 首字节保活 | 上游迟迟不吐数据时，先开 SSE 流并每 10s 发注释心跳，绕开反代的 120s 超时 |
 | 推理链回灌 | 把 reasoning item 按 `call_id` 归档并插回下一轮，多轮工具调用不再丢思维链 |
 
+## 协议支持矩阵
+
+客户端说一种协议，上游说另一种，网关负责把它们对上：
+
+| 客户端 → ＼ 上游 ↓ | chat | responses | messages |
+|---|---|---|---|
+| **chat**（`/v1/chat/completions`） | ✅ 原样透传 | ✅ 双向翻译 | ✅ 双向翻译 |
+| **responses**（`/v1/responses`） | ❌ | ✅ 原样直通 | ❌ |
+| **messages**（`/v1/messages`） | ❌ | ❌ | ✅ 原样直通 |
+
+也就是说 **chat 是中枢**：客户端只要说 chat，就能用任意协议的上游；而 responses / messages 原生客户端（Codex、Claude Code 这类）走同协议直通，不能跨协议。想让 ❌ 那几格也通，得补四组转换（请求侧 `responses→chat`、`messages→chat`，响应侧 `chat→responses`、`chat→messages`），目前没做。
+
 ## 跑起来
 
 ```bash
