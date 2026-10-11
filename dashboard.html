@@ -1,0 +1,1176 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>LLM 网关</title>
+<style>
+  :root{
+    --bg:#000; --panel:#080706; --panel2:#100d09; --line:#4a3b28; --line2:#2a2117;
+    --text:#e2dad0; --dim2:#9b8f80; --amber:#ffb000; --orange:#ff8c42;
+    --red:#ff6b61; --green:#a8d47f; --cyan:#8ad9c6; --violet:#cba7ff;
+    --btn:#171208; --btn2:#1a1408; --btn3:#1d160c; --inputbg:#000; --toastbg:#141009;
+    --onfg:#000; --dangerline:#5b2a26; --dangerbg:rgba(255,107,97,.08); --hover:rgba(255,176,0,.07);
+    --colline:#2a2117; --headwash:rgba(255,176,0,.12);
+    --fs:15px;              /* 基准字号，顶栏可切换 */
+  }
+  /* 亮色主题：暖纸底 + 琥珀强调（顶栏可切换，存 localStorage） */
+  html[data-theme="light"]{
+    --bg:#f4eee3; --panel:#fffdf7; --panel2:#efe7d8; --line:#c4b092; --line2:#ded2bd;
+    --text:#2d2720; --dim2:#7a6f60; --amber:#9c5a00; --orange:#bf5518;
+    --red:#b0352a; --green:#3b7318; --cyan:#0d6f63; --violet:#6741b8;
+    --btn:#e8dfcc; --btn2:#f2e8d5; --btn3:#f5ecda; --inputbg:#fffdf7; --toastbg:#3a3227;
+    --onfg:#fff8ec; --dangerline:#d8a79f; --dangerbg:rgba(176,53,42,.08); --hover:rgba(160,90,0,.10);
+    --colline:#e4dac6; --headwash:rgba(160,90,0,.10);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+    font-family:ui-monospace,"JetBrains Mono","Cascadia Mono",Menlo,Consolas,"Noto Sans Mono CJK SC","Microsoft YaHei",monospace;
+    font-size:var(--fs);line-height:1.55}
+  .wrap{padding:10px;display:flex;flex-direction:column;gap:10px;max-width:1500px;margin:0 auto}
+
+  .top{display:flex;align-items:center;gap:12px;flex-wrap:wrap;border:1px solid var(--line);padding:8px 12px;background:var(--panel2)}
+  .top b{color:var(--amber);letter-spacing:.1em;font-size:calc(var(--fs)*1.05)}
+  .nav{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+  .nav button{background:var(--btn);border:1px solid var(--line);color:var(--dim2);font:inherit;
+    padding:5px 14px;cursor:pointer;font-size:calc(var(--fs)*0.92)}
+  .nav button.on{color:var(--onfg);background:var(--amber);border-color:var(--amber);font-weight:700}
+  .subnav{display:flex;gap:6px;flex-wrap:wrap;padding-left:14px;border-left:2px solid var(--line2)}
+  .subnav button{background:transparent;border:1px solid var(--line2);color:var(--dim2);font:inherit;
+    padding:3px 12px;cursor:pointer;font-size:calc(var(--fs)*0.88)}
+  .subnav button.on{color:var(--amber);border-color:var(--amber);background:var(--btn2)}
+  .spacer{flex:1}
+  .fsgroup{display:flex;gap:4px;align-items:center;color:var(--dim2);font-size:calc(var(--fs)*0.85)}
+  .fsgroup button{background:var(--btn);border:1px solid var(--line);color:var(--dim2);font:inherit;padding:3px 9px;cursor:pointer}
+  .fsgroup button.on{color:var(--onfg);background:var(--amber);border-color:var(--amber)}
+
+  .box{border:1px solid var(--line);background:var(--panel)}
+  .box>.h{display:flex;align-items:center;gap:8px;padding:4px 10px;border-bottom:1px solid var(--line);
+    background:linear-gradient(90deg,var(--headwash),transparent 65%);color:var(--amber);
+    letter-spacing:.06em;font-size:calc(var(--fs)*0.88)}
+  .box>.h .line{flex:1;height:1px;background:var(--line2)}
+  .box>.b{padding:10px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  @media(max-width:1000px){.grid2,.grid3,.grid4{grid-template-columns:1fr}}
+
+  .tile{border:1px solid var(--line);background:var(--panel2);padding:8px 12px}
+  .tile .k{color:var(--dim2);font-size:calc(var(--fs)*0.8);letter-spacing:.05em}
+  .tile .v{font-size:calc(var(--fs)*1.7);color:var(--amber);line-height:1.35}
+  .tile .s{color:var(--dim2);font-size:calc(var(--fs)*0.8)}
+
+  table{width:100%;border-collapse:collapse;font-size:calc(var(--fs)*0.9)}
+  th{text-align:center;color:var(--dim2);font-weight:400;border-bottom:1px solid var(--line2);
+    padding:5px 8px;white-space:nowrap;font-size:calc(var(--fs)*0.82)}
+  /* 第一列原本左对齐，现在整表统一居中；想恢复左对齐就把下面这行改成 th.l,td.l{text-align:left} */
+  th.l,td.l{text-align:center}
+  th.sortable{cursor:pointer;user-select:none}
+  th.sortable:hover{color:var(--text)}
+  th.sorted{color:var(--amber)}
+  td{text-align:center;padding:5px 8px;border-bottom:1px dotted var(--line2);white-space:nowrap}
+  /* 列边线（淡）方便对齐看位置；最后一列不画 */
+  th,td{border-right:1px solid var(--colline)}
+  th:last-child,td:last-child{border-right:0}
+  /* 长内容列（IPv6、模型/上游名、Base URL）：允许自动换行，别把表格撑爆 */
+  td.wr{white-space:normal;word-break:break-all;overflow-wrap:anywhere;line-height:1.35}
+  /* 封顶宽度：内容在 td 内再套一层，宽度锁死（等宽字体下 1ch = 1 字符） */
+  .wrc{display:inline-block;white-space:normal;word-break:break-all;overflow-wrap:anywhere;vertical-align:top}
+  /* 整表居中：表头与单元格都居中（长内容列保持可换行） */
+  @media (min-width:821px){ td.wr{text-align:center} }   /* 手机卡片式仍是“左标签/右值” */
+  tr:hover td{background:var(--hover)}
+
+  .amber{color:var(--amber)} .green{color:var(--green)} .red{color:var(--red)}
+  .dim{color:var(--dim2)} .cyan{color:var(--cyan)} .orange{color:var(--orange)} .violet{color:var(--violet)}
+  .bar{height:64px;display:flex;align-items:flex-end;gap:2px}
+  .bar .col{flex:1;background:linear-gradient(180deg,var(--amber),rgba(255,140,66,.3));min-height:2px}
+  .bar .col:hover{background:var(--orange)}
+  .axis{display:flex;justify-content:space-between;color:var(--dim2);font-size:calc(var(--fs)*0.78);margin-top:3px}
+  .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+  .ok{background:var(--green);box-shadow:0 0 8px var(--green)} .bad{background:var(--red);box-shadow:0 0 8px var(--red)}
+
+  input,select{background:var(--inputbg);border:1px solid var(--line);color:var(--text);font:inherit;
+    font-size:calc(var(--fs)*0.9);padding:5px 9px;width:100%}
+  button.act{background:var(--btn3);border:1px solid var(--line);color:var(--amber);font:inherit;
+    font-size:calc(var(--fs)*0.9);padding:6px 16px;cursor:pointer}
+  button.act:hover{border-color:var(--amber)}
+  button.danger{color:var(--red);border-color:var(--dangerline);padding:3px 10px;font-size:calc(var(--fs)*0.82)}
+  .field{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
+  .field label{color:var(--dim2);font-size:calc(var(--fs)*0.84)}
+  .hint{color:var(--dim2);font-size:calc(var(--fs)*0.84)}
+  .msg{padding:8px 0;color:var(--dim2)}
+  .pill{border:1px solid var(--line);padding:1px 7px;font-size:calc(var(--fs)*0.78);color:var(--dim2)}
+  .hidden{display:none !important}
+  code{color:var(--cyan);word-break:break-all}
+  .gwtoggle{background:var(--btn);border:1px solid var(--line);color:var(--dim2);font:inherit;
+    font-size:calc(var(--fs)*0.92);padding:5px 14px;cursor:pointer}
+  .gwtoggle.on{color:var(--onfg);background:var(--green);border-color:var(--green);font-weight:700}
+  .gwtoggle.off{color:var(--onfg);background:var(--red);border-color:var(--red);font-weight:700}
+  .offbanner{border:1px solid var(--red);background:var(--dangerbg);color:var(--red);
+    padding:8px 12px;font-size:calc(var(--fs)*0.92)}
+  .filters{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:0 0 8px}
+  .filters select,.filters input{width:auto;min-width:140px;max-width:230px}
+  .filters input[type=datetime-local]{min-width:190px}
+  /* 统计时间口径按钮组（概览 / 按模型 / 按上游 / 按客户端 共用） */
+  .rbtns{display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:0}
+  button.rbtn{background:var(--btn3);border:1px solid var(--line);color:var(--dim2);font:inherit;
+    font-size:calc(var(--fs)*0.86);padding:4px 11px;cursor:pointer}
+  button.rbtn:hover{border-color:var(--amber);color:var(--amber)}
+  button.rbtn.on{color:var(--amber);border-color:var(--amber);background:var(--btn2);font-weight:700}
+  /* 筛选区：每个条件一列，标签在上 */
+  .filtergrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:8px 10px;align-items:end;padding:0 0 10px}
+  .filtergrid label{display:flex;flex-direction:column;gap:3px;color:var(--dim2);font-size:calc(var(--fs)*0.8)}
+  .filtergrid label>select,.filtergrid label>input{width:100%;max-width:none;min-width:0}
+  .filtergrid .fbtns{display:flex;gap:8px;align-items:center}
+  .filtergrid .fbtns button{flex:1}
+  /* 表格容器：过宽时自身横向滚动，不撑破页面 */
+  .tblwrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .tblwrap>table{min-width:0}
+  .pager{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 6px 0}
+  .pager button:disabled{opacity:.35;cursor:default;border-color:var(--line2);color:var(--dim2)}
+  .toast{position:fixed;right:14px;bottom:14px;border:1px solid var(--line);background:var(--toastbg);
+    color:var(--amber);padding:10px 16px;font-size:calc(var(--fs)*0.9);opacity:0;transition:opacity .2s;pointer-events:none}
+  .toast.on{opacity:1}
+
+  /* ---------- 手机 / 窄屏 ---------- */
+  @media (max-width:820px){
+    .wrap{padding:6px;gap:8px}
+    .top{gap:8px;padding:6px 8px}
+    .top b{font-size:calc(var(--fs)*0.95)}
+    .nav{gap:4px}
+    .nav button{padding:7px 10px;font-size:calc(var(--fs)*0.88)}
+    .subnav{padding-left:8px;gap:4px}
+    .subnav button{padding:6px 10px;font-size:calc(var(--fs)*0.85)}
+    .grid4,.grid3{grid-template-columns:1fr 1fr;gap:6px}
+    .grid2{grid-template-columns:1fr;gap:8px}
+    .tile{padding:6px 8px}
+    .tile .v{font-size:calc(var(--fs)*1.3)}
+    .box>.b{padding:8px}
+    .box>.h{font-size:calc(var(--fs)*0.82)}
+    .bar{height:54px}
+    /* 表格 → 卡片式：隐藏表头，每行一张卡，每格左边显示列名 */
+    table{font-size:calc(var(--fs)*0.88)}
+    thead{display:none}
+    tbody tr{display:block;border:1px solid var(--line2);background:var(--panel2);
+      margin-bottom:6px;padding:4px 8px}
+    tbody td{display:flex;justify-content:space-between;align-items:baseline;gap:10px;
+      border:0;padding:3px 0;text-align:right;white-space:normal;word-break:break-all}
+    tbody td::before{content:attr(data-label);color:var(--dim2);font-size:calc(var(--fs)*0.78);
+      text-align:left;flex:0 0 auto}
+    tbody td.l{font-weight:700;color:var(--amber);border-bottom:1px dotted var(--line2);
+      margin-bottom:3px;padding-bottom:4px}
+    tbody td.l::before{content:''}
+    .field label{font-size:calc(var(--fs)*0.82)}
+    .fsgroup input{width:120px !important}
+    .gwtoggle{padding:6px 10px}
+    input,select{padding:7px 8px}
+    button.act{padding:8px 14px}
+    button.danger{padding:6px 10px}
+    .toast{left:10px;right:10px;bottom:10px}
+    /* 手机上表格已是卡片式，不需要横向滚动 */
+    .tblwrap{overflow-x:visible}
+    .tblwrap>table{min-width:0}
+    .filtergrid{grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:6px 8px}
+    .filtergrid label>select,.filtergrid label>input{min-width:0}
+    .filters .act{padding:6px 10px;font-size:calc(var(--fs)*0.85)}
+  }
+  @media (max-width:430px){
+    .grid4,.grid3{grid-template-columns:1fr}
+    .fsgroup{font-size:calc(var(--fs)*0.78)}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="top">
+    <b>LLM GATEWAY</b>
+    <span id="dot" class="dot bad"></span>
+    <span id="status" class="dim">连接中…</span>
+    <button id="gw_toggle" class="gwtoggle">网关：--</button>
+    <button id="cap_toggle" class="gwtoggle">抓包：--</button>
+    <span class="spacer"></span>
+    <span class="fsgroup">字号
+      <button data-fs="13">小</button><button data-fs="15">中</button><button data-fs="18">大</button>
+    </span>
+    <span class="fsgroup">主题
+      <button data-thm="dark">暗</button><button data-thm="light">亮</button>
+    </span>
+    <span class="fsgroup">key
+      <input id="key" type="password" placeholder="本机访问需填" style="width:190px">
+      <button id="savekey">存</button>
+    </span>
+  </div>
+
+  <div class="nav">
+    <button data-tab="stats" class="on">用量统计</button>
+    <button data-tab="models">模型列表</button>
+    <button data-tab="providers">增加供应商</button>
+    <button data-tab="keys">客户端 key</button>
+    <span class="spacer"></span>
+    <button id="reload">刷新</button>
+  </div>
+
+  <div class="subnav" id="subnav">
+    <button data-sub="overview" class="on">概览</button>
+    <button data-sub="bymodel">按模型</button>
+    <button data-sub="byprovider">按上游</button>
+    <button data-sub="bykey">按客户端</button>
+    <button data-sub="recent">最近请求</button>
+  </div>
+
+  <div id="offbanner" class="offbanner hidden">⚠ <b>网关总开关已关闭</b> —— 所有 <code>/v1</code> 请求返回 503，上游不会被调用（不消耗额度）。看板仍可访问，随时可以再打开。</div>
+
+  <!-- ================= 用量统计（子页） ================= -->
+  <section id="tab-stats">
+
+    <!-- 时间口径：作用于 概览 / 按模型 / 按上游 / 按客户端 -->
+    <div id="rangebar" class="box">
+      <div class="h">统计时间口径<span class="line"></span><span class="dim">作用于概览与三张统计表（最近请求页有自己的筛选）</span></div>
+      <div class="b" style="padding:8px 10px">
+        <div class="rbtns">
+          <button class="rbtn" data-rng="1h">最近 1 小时</button>
+          <button class="rbtn" data-rng="5h">最近 5 小时</button>
+          <button class="rbtn" data-rng="24h">最近 24 小时</button>
+          <button class="rbtn" data-rng="today">今天</button>
+          <button class="rbtn" data-rng="yesterday">昨天</button>
+          <button class="rbtn" data-rng="week">本周</button>
+          <button class="rbtn" data-rng="month">本月</button>
+          <button class="rbtn" data-rng="lastmonth">上月</button>
+          <button class="rbtn" data-rng="all">全部</button>
+          <button class="rbtn" data-rng="custom">指定时间…</button>
+        </div>
+        <div class="filters hidden" id="rng_custom" style="padding:8px 0 0">
+          <span class="hint">起始</span><input id="rng_from" type="datetime-local">
+          <span class="hint">结束</span><input id="rng_to" type="datetime-local">
+          <button class="act" id="rng_apply">应用</button>
+          <span class="hint">留空＝不限</span>
+        </div>
+        <div class="hint" id="range_info" style="padding-top:6px"></div>
+      </div>
+    </div>
+
+    <!-- 概览 -->
+    <div id="sub-overview">
+      <div class="grid4" style="margin-bottom:10px">
+        <div class="tile"><div class="k">请求总数</div><div class="v" id="t_req">-</div>
+          <div class="s">错误 <span id="t_err" class="red">-</span> · 运行 <span id="t_up" class="cyan">-</span></div></div>
+        <div class="tile"><div class="k">输入 / 输出 tokens</div><div class="v" id="t_tok">-</div>
+          <div class="s">推理 <span id="t_reason" class="violet">-</span></div></div>
+        <div class="tile"><div class="k">缓存命中率</div><div class="v" id="t_hit">-</div>
+          <div class="s">命中 token <span id="t_cached">-</span> / 输入 <span id="t_in">-</span></div></div>
+        <div class="tile"><div class="k">数据量（上行 / 下行）</div><div class="v" id="t_bytes">-</div>
+          <div class="s">实际写出 <span id="t_bres">-</span> · 请求体 / 上游响应体</div></div>
+        <div class="tile"><div class="k">首字 / 总耗时（均）</div><div class="v" id="t_lat">-</div>
+          <div class="s" id="t_lat_s">-</div></div>
+      </div>
+      <div class="box">
+        <div class="h"><span id="chart_title">输入 tokens</span><span class="line"></span><span class="dim" id="chart_sub">按本地时间</span><span id="h24s" class="dim"></span></div>
+        <div class="b"><div class="bar" id="bar"></div><div class="axis" id="axis"></div></div>
+      </div>
+      <div class="box" style="margin-top:10px">
+        <div class="h">上游额度<span class="line"></span><span class="dim" id="q_at"></span>
+          <button class="act" id="q_refresh" style="margin-left:8px">刷新</button></div>
+        <div class="b" id="quota"><span class="dim">读取中…</span></div>
+      </div>
+    </div>
+
+    <!-- 按模型 -->
+    <div id="sub-bymodel" class="hidden">
+      <div class="box">
+        <div class="h">按模型<span class="line"></span><span class="dim">命中% = 缓存读取 / 输入；括号内为命中 token 数</span></div>
+        <div class="b" style="padding:0 6px 6px"><div class="tblwrap"><table id="tbl_model"></table></div></div>
+      </div>
+    </div>
+
+    <!-- 按上游 -->
+    <div id="sub-byprovider" class="hidden">
+      <div class="box">
+        <div class="h">按上游<span class="line"></span><span id="pv_n" class="dim"></span></div>
+        <div class="b" style="padding:0 6px 6px"><div class="tblwrap"><table id="tbl_provider"></table></div></div>
+      </div>
+    </div>
+
+    <!-- 按客户端 -->
+    <div id="sub-bykey" class="hidden">
+      <div class="box">
+        <div class="h">按客户端 key<span class="line"></span><span id="k_n" class="dim"></span></div>
+        <div class="b" style="padding:0 6px 6px"><div class="tblwrap"><table id="tbl_key"></table></div></div>
+      </div>
+    </div>
+
+    <!-- 最近请求 -->
+    <div id="sub-recent" class="hidden">
+      <div class="box">
+        <div class="h">最近请求<span class="line"></span><span id="recs" class="dim"></span></div>
+        <div class="b">
+          <div class="filtergrid">
+            <label>模型<select id="f_model"><option value="">全部模型</option></select></label>
+            <label>请求 key<select id="f_key"><option value="">全部 key</option></select></label>
+            <label>IP 包含<input id="f_ip" placeholder="如 1.2.3 或 172.28"></label>
+            <label>状态<select id="f_status">
+              <option value="">全部状态</option>
+              <option value="ok">成功 (2xx)</option>
+              <option value="err">错误 (≥400)</option>
+            </select></label>
+            <label>起始时间<input id="f_from" type="datetime-local"></label>
+            <label>结束时间<input id="f_to" type="datetime-local"></label>
+            <label>每页条数<select id="f_limit">
+              <option value="50" selected>每页 50 条</option>
+              <option value="100">每页 100 条</option>
+              <option value="200">每页 200 条</option>
+              <option value="500">每页 500 条</option>
+            </select></label>
+            <div class="fbtns">
+              <button class="act" id="f_apply">查询</button>
+              <button class="act" id="f_reset">重置</button>
+            </div>
+          </div>
+          <div class="filters">
+            <span class="hint">快捷时间</span>
+            <button class="act" data-range="1h">1 小时</button>
+            <button class="act" data-range="24h">24 小时</button>
+            <button class="act" data-range="7d">7 天</button>
+            <button class="act" data-range="today">今天</button>
+            <button class="act" data-range="all">全部</button>
+            <span class="hint" id="f_info"></span>
+          </div>
+          <div style="padding:0 6px 6px"><div class="tblwrap"><table id="tbl_recent"></table></div></div>
+          <div class="pager">
+            <button class="act" data-page="first">« 首页</button>
+            <button class="act" data-page="prev">‹ 上一页</button>
+            <span class="hint" id="f_pageno">第 1 / 1 页</span>
+            <button class="act" data-page="next">下一页 ›</button>
+            <button class="act" data-page="last">末页 »</button>
+            <span class="hint" id="f_pagesize_hint"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ================= 模型列表 ================= -->
+  <section id="tab-models" class="hidden">
+    <div class="box">
+      <div class="h">模型列表<span class="line"></span><span id="m_count" class="dim"></span></div>
+      <div class="b">
+        <div style="display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+          <input id="m_search" placeholder="搜索：模型名 / 供应商 / 协议…" style="max-width:360px">
+          <select id="m_filter" style="max-width:220px"><option value="">全部供应商</option></select>
+        </div>
+        <div class="tblwrap"><table id="tbl_models"></table></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 增加供应商 ================= -->
+  <section id="tab-providers" class="hidden">
+    <div class="box" style="margin-bottom:10px">
+      <div class="h">已有供应商<span class="line"></span></div>
+      <div class="b" style="padding:0 6px 6px"><div class="tblwrap"><table id="tbl_providers"></table></div></div>
+    </div>
+
+    <div class="grid2">
+      <div class="box">
+        <div class="h"><span id="p_title">新增 / 覆盖供应商</span><span class="line"></span></div>
+        <div class="b">
+          <div id="p_editinfo" class="hint hidden" style="margin-bottom:8px"></div>
+          <div class="field"><label>名称（英文，唯一）</label><input id="p_name" placeholder="myapi"></div>
+          <div class="field"><label>客户端前缀（模型名 = 前缀/模型ID，默认同名称）</label><input id="p_prefix" placeholder="myapi"></div>
+          <div class="field"><label>Base URL（写到 /v1 为止）</label><input id="p_url" placeholder="https://api.example.com/v1"></div>
+          <div class="field"><label>API key（写入 .env，不回显）</label><input id="p_key" type="password" placeholder="sk-..."></div>
+          <div class="field"><label>key 环境变量名（留空自动）</label><input id="p_env" placeholder="MYAPI_API_KEY"></div>
+          <div class="field"><label>User-Agent（可选，某些上游必须要浏览器 UA）</label>
+            <input id="p_ua" list="ua_presets" placeholder="Mozilla/5.0 …">
+            <datalist id="ua_presets">
+              <option value="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36">Chrome 131 / Windows</option>
+              <option value="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36">Chrome 131 / macOS</option>
+              <option value="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0">Firefox 133 / Windows</option>
+            </datalist></div>
+          <div class="field"><label>额外请求头（JSON，可选）</label><input id="p_hdr" placeholder='{"x-upstream-session":"__SESSION__"}'></div>
+          <div class="field"><label>推理链回灌（chat↔responses 桥接时把 reasoning 项插回，保住思维链）</label>
+            <label style="display:flex;gap:8px;align-items:center;color:var(--text)"><input type="checkbox" id="p_echo" style="width:auto"> 开启 reasoning_echo</label></div>
+          <button class="act" id="p_submit">保存供应商</button>
+          <button class="act" id="p_cancel" style="display:none;margin-left:8px">取消编辑</button>
+          <span class="hint" style="margin-left:12px">保存后立即热加载，不用重启</span>
+        </div>
+      </div>
+
+      <div class="box">
+        <div class="h">给供应商加模型<span class="line"></span></div>
+        <div class="b">
+          <div class="field"><label>前缀（已有供应商的前缀）</label>
+            <div style="display:flex;gap:8px">
+              <input id="mm_prefix" placeholder="ocg / ocz / myapi">
+              <button class="act" id="mm_fetch" style="white-space:nowrap">获取该供应商全部模型</button>
+            </div></div>
+          <div id="mm_status" class="hint"></div>
+
+          <div id="mm_panel" class="hidden" style="margin-top:10px">
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
+              <button class="act" id="mm_all">全选</button>
+              <button class="act" id="mm_none">清空</button>
+              <input id="mm_search" placeholder="过滤…" style="max-width:200px">
+              <span class="hint" id="mm_selinfo"></span>
+            </div>
+            <div id="mm_list" style="max-height:300px;overflow:auto;border:1px solid var(--line);padding:6px"></div>
+            <div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
+              <select id="mm_bulkfmt" style="max-width:240px">
+                <option value="">自动探测（推荐）</option>
+                <option value="chat">chat（/chat/completions）</option>
+                <option value="responses">responses（/responses）</option>
+                <option value="messages">messages（Anthropic）</option>
+              </select>
+              <button class="act" id="mm_bulkadd">添加所选</button>
+            </div>
+          </div>
+
+          <div class="hint" style="margin:14px 0 8px;border-top:1px dotted var(--line2);padding-top:10px">手动单个添加</div>
+          <div class="field"><label>模型 ID（上游真实名字）</label><input id="mm_id" placeholder="grok-4.6"></div>
+          <div class="field"><label>协议</label>
+            <select id="mm_fmt">
+              <option value="">自动探测（推荐）</option>
+              <option value="chat">chat（/chat/completions）</option>
+              <option value="responses">responses（/responses）</option>
+              <option value="messages">messages（Anthropic）</option>
+            </select></div>
+          <button class="act" id="mm_submit">添加模型</button>
+          <div class="hint" style="margin-top:12px">协议留空＝自动探测：首次请求按 chat→responses→messages 依次试，成功即记住。</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 客户端 key ================= -->
+  <section id="tab-keys" class="hidden">
+    <div class="box" style="margin-bottom:10px">
+      <div class="h">已有 key<span class="line"></span></div>
+      <div class="b" style="padding:0 6px 6px"><div class="tblwrap"><table id="tbl_keys"></table></div></div>
+      <div class="hint" style="padding:0 10px 10px">「显示 / 复制」只在看板域名（已登录）或本机可用；key 值不会随统计快照下发，需要时才单独取。</div>
+    </div>
+    <div class="box">
+      <div class="h">新建 key<span class="line"></span></div>
+      <div class="b">
+        <div class="field" style="max-width:420px"><label>名称（例如 codex / claude-code / st）</label><input id="k_name" placeholder="codex"></div>
+        <button class="act" id="k_submit">生成</button>
+        <div id="k_out" class="hint" style="margin-top:12px"></div>
+      </div>
+    </div>
+  </section>
+
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let KEY = localStorage.getItem('gw_key') || '';
+let STATS = null, CONF = null, TAB = 'stats';
+$('key').value = KEY;
+
+/* ---------- 字号 ---------- */
+function applyFs(v) {
+  document.documentElement.style.setProperty('--fs', v + 'px');
+  document.querySelectorAll('.fsgroup button[data-fs]').forEach(b => b.classList.toggle('on', b.dataset.fs === String(v)));
+}
+applyFs(localStorage.getItem('gw_fs') || '15');
+document.querySelectorAll('.fsgroup button[data-fs]').forEach(b => b.onclick = () => {
+  localStorage.setItem('gw_fs', b.dataset.fs); applyFs(b.dataset.fs);
+});
+
+/* ---------- 亮/暗主题 ---------- */
+function applyTheme(v) {
+  const t = v === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = t;
+  document.querySelectorAll('.fsgroup button[data-thm]').forEach(b => b.classList.toggle('on', b.dataset.thm === t));
+  localStorage.setItem('gw_theme', t);
+}
+applyTheme(localStorage.getItem('gw_theme') || 'dark');
+document.querySelectorAll('.fsgroup button[data-thm]').forEach(b => b.onclick = () => applyTheme(b.dataset.thm));
+
+/* ---------- 小工具 ---------- */
+const fmt = (n) => n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n ?? 0);
+const ms = (n) => n >= 1000 ? (n / 1000).toFixed(2) + 's' : (n || 0) + 'ms';
+const hm = (iso) => String(iso).slice(11, 16);
+const hitCls = (h) => h >= 50 ? 'green' : h >= 15 ? 'amber' : 'dim';
+// 字节数格式化（数据包大小）：B / KB / MB / GB / TB，1 KB = 1000 B（网络口径，与此前 K/M 数字一致）
+const fmtB = (n) => {
+  n = Number(n || 0);
+  if (!isFinite(n) || n <= 0) return '0 B';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let i = 0;
+  while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; }
+  return (i ? n.toFixed(n >= 100 ? 0 : n >= 10 ? 1 : 2) : String(Math.round(n))) + ' ' + u[i];
+};
+// 命中率 + 命中 token 数，例如 "61% (7.0k)"；没采到 usage 时显示 — 并把原因放进 tooltip
+const hitCell = (v, r) => {
+  if (!(v && v.in)) {
+    const why = (r && r.usage_src === 'missing')
+      ? `未采集到 usage${r.last_evt ? `；流里最后事件=${r.last_evt}` : '；流里没有可解析的事件'}${r.up_head ? `；上游开头=${String(r.up_head).slice(0, 120)}` : ''}`
+      : '该请求未采集到 usage，非 0% 命中';
+    return `<span class="dim" title="${esc(why)}">—</span>`;
+  }
+  return `<span class="${hitCls(v.cached / v.in * 100)}">${(v.cached / v.in * 100).toFixed(0)}%</span> <span class="dim">(${fmt(v.cached)})</span>`;
+};
+const esc = (s) => String(s ?? '').replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
+function toast(msg, bad) {
+  const t = $('toast'); t.textContent = msg;
+  t.className = 'toast on' + (bad ? ' red' : '');
+  setTimeout(() => t.className = 'toast', 3000);
+}
+function table(el, head, rows, empty, vals, wrap, capCh) {
+  // vals（可选）：每行的原始可比值；给了就支持「点表头排序」
+  // wrap（可选）：需要自动换行的列。元素可以是「下标」（用 capCh 统一封顶）或 [下标, 该列封顶 ch]
+  // capCh（可选）：wrap 里用裸下标时的统一封顶宽度（ch，等宽字体下=字符数）
+  el._T = { head, rows, empty, vals, wrap, capCh };
+  // 归一化 wrap：列下标 -> 该列封顶 ch（null＝可换行但不封顶）
+  const spec = new Map();
+  for (const w of (wrap || [])) {
+    if (Array.isArray(w)) spec.set(w[0], w[1] || null);
+    else spec.set(w, capCh || null);
+  }
+  el._T.wrapSpec = spec;
+  if (el._si === undefined) { el._si = null; el._sd = -1; }   // -1＝降序（大在前）
+  drawTable(el);
+}
+function drawTable(el) {
+  const T = el._T; if (!T) return;
+  const { head, rows, empty, vals } = T;
+  if (!rows.length) { el.innerHTML = `<tbody><tr><td class="msg">${empty || '暂无数据'}</td></tr></tbody>`; return; }
+  const order = rows.map((_, i) => i);
+  if (el._si != null && vals) order.sort((a, b) => {
+    const x = vals[a][el._si], y = vals[b][el._si];
+    const c = (typeof x === 'number' && typeof y === 'number') ? (x - y) : String(x).localeCompare(String(y), 'zh');
+    return el._sd < 0 ? -c : c;                              // 点同一列切换升降
+  });
+  el.innerHTML = '<thead><tr>' + head.map((h, i) => {
+    const cls = [i === 0 ? 'l' : '', vals ? 'sortable' : '', el._si === i ? 'sorted' : ''].filter(Boolean).join(' ');
+    const mark = el._si === i ? (el._sd < 0 ? ' ▼' : ' ▲') : '';
+    return `<th${cls ? ` class="${cls}"` : ''} data-col="${i}">${h}${mark}</th>`;
+  }).join('') + '</tr></thead><tbody>' +
+    order.map(i => '<tr>' + rows[i].map((c, j) => {
+      const cap = T.wrapSpec ? T.wrapSpec.get(j) : undefined;
+      const wr = T.wrapSpec ? T.wrapSpec.has(j) : false;
+      const cls = [j === 0 ? 'l' : '', wr ? 'wr' : ''].filter(Boolean).join(' ');
+      const content = (wr && cap) ? `<span class="wrc" style="max-width:${cap}ch">${c}</span>` : c;
+      return `<td data-label="${esc(head[j] || '')}"${cls ? ` class="${cls}"` : ''}>${content}</td>`;
+    }).join('') + '</tr>').join('') + '</tbody>';
+  if (vals) el.querySelectorAll('th[data-col]').forEach(th => th.onclick = () => {
+    const i = +th.dataset.col;
+    if (el._si === i) el._sd = -el._sd; else { el._si = i; el._sd = -1; }
+    drawTable(el);
+  });
+}
+async function api(path, body) {
+  const h = { 'Content-Type': 'application/json' };
+  if (KEY) h['x-api-key'] = KEY;                       // 不用 Authorization，避免与面板 Basic 冲突
+  const r = await fetch(path, { method: body ? 'POST' : 'GET', headers: h, body: body ? JSON.stringify(body) : undefined });
+  const t = await r.text();
+  let j = null; try { j = JSON.parse(t); } catch { }
+  if (!r.ok) throw new Error((j?.error?.message) || ('HTTP ' + r.status));
+  return j;
+}
+
+/* ---------- 导航 ---------- */
+let SUB = localStorage.getItem('gw_sub') || 'overview';
+function syncSub() {
+  document.querySelectorAll('#subnav button[data-sub]').forEach(x => x.classList.toggle('on', x.dataset.sub === SUB));
+  ['overview', 'bymodel', 'byprovider', 'bykey', 'recent'].forEach(s => $('sub-' + s).classList.toggle('hidden', s !== SUB));
+  $('subnav').classList.toggle('hidden', TAB !== 'stats');
+  $('rangebar').classList.toggle('hidden', SUB === 'recent');
+}
+document.querySelectorAll('#subnav button[data-sub]').forEach(b => b.onclick = () => {
+  SUB = b.dataset.sub; localStorage.setItem('gw_sub', SUB); syncSub();
+  if (SUB === 'recent') loadRequests();
+});
+document.querySelectorAll('.nav button[data-tab]').forEach(b => b.onclick = () => {
+  TAB = b.dataset.tab;
+  document.querySelectorAll('.nav button[data-tab]').forEach(x => x.classList.toggle('on', x === b));
+  ['stats', 'models', 'providers', 'keys'].forEach(t => $('tab-' + t).classList.toggle('hidden', t !== TAB));
+  syncSub();
+  if (TAB === 'stats') { refreshStats(); return; }
+  loadConfig(true).then(() => {
+    if (TAB === 'models') renderModels();
+    if (TAB === 'providers') renderProviders();
+    if (TAB === 'keys') renderKeys();
+  });
+});
+$('savekey').onclick = () => { KEY = $('key').value.trim(); localStorage.setItem('gw_key', KEY); refreshStats(); };
+
+/* ---------- 网关总开关 ---------- */
+let ENABLED = true;
+function renderToggle() {
+  const b = $('gw_toggle');
+  b.textContent = ENABLED ? '网关：开' : '网关：关';
+  b.className = 'gwtoggle ' + (ENABLED ? 'on' : 'off');
+  $('offbanner').classList.toggle('hidden', ENABLED);
+}
+/* ---------- 抓包开关（热生效，不用重启） ---------- */
+let CAP = { on: false, bytes: 0, files: 0, last: null };
+function renderCap(c) {
+  if (c) CAP = c;
+  const b = $('cap_toggle');
+  b.textContent = '抓包：' + (CAP.on ? '开' : '关') + (CAP.on && CAP.bytes ? ` ${fmtB(CAP.bytes)}` : '');
+  b.className = 'gwtoggle ' + (CAP.on ? 'on' : 'off');
+  b.title = CAP.on
+    ? `正在把客户端【完整请求体】写入 temp/capture-*.jsonl\n${CAP.files || 0} 个文件 / 合计 ${fmtB(CAP.bytes)}${CAP.last ? '\n最后写入 ' + new Date(CAP.last).toLocaleString('zh-CN', { hour12: false }) : ''}\n超过 3 天的自动 gzip 归档`
+    : '未抓包。排查「客户端说上下文不对」时才需要打开（会把完整请求体写盘）';
+}
+$('cap_toggle').onclick = async () => {
+  const next = !CAP.on;
+  if (next && !confirm('打开抓包？\n\n· 每次请求把【客户端完整请求体】写入 temp/capture-YYYY-MM-DD.jsonl\n· 实测约 460KB/条、400MB/天；超过 3 天的自动 gzip 归档\n· 内容含全部对话历史，排查完请关掉')) return;
+  try {
+    const r = await api('/api/config/toggle_capture', { enabled: next });
+    CAP.on = r.capture !== false;
+    renderCap();
+    toast(CAP.on ? '抓包已打开 → temp/capture-*.jsonl' : '抓包已关闭');
+  } catch (e) { toast('失败：' + e.message, 1); }
+};
+$('gw_toggle').onclick = async () => {
+  const next = !ENABLED;
+  if (!next && !confirm('关闭网关总开关？\n\n· 所有 /v1 请求立刻返回 503\n· 上游不再被调用（不消耗额度）\n· 看板仍可访问，随时能再打开')) return;
+  try {
+    const r = await api('/api/config/toggle', { enabled: next });
+    ENABLED = r.enabled !== false;
+    renderToggle();
+    toast(ENABLED ? '网关已开启' : '网关已关闭（请求将返回 503）');
+  } catch (e) { toast('失败：' + e.message, 1); }
+};
+$('reload').onclick = () => { refreshStats(); loadConfig(true).then(() => {
+  if (TAB === 'models') renderModels(); if (TAB === 'providers') renderProviders(); if (TAB === 'keys') renderKeys(); }); };
+
+/* ---------- 用量统计：时间口径 ---------- */
+let RANGE = localStorage.getItem('gw_range') || 'all';
+const DAY = 86400e3;
+const RANGE_NAME = { '1h': '最近 1 小时', '5h': '最近 5 小时', '24h': '最近 24 小时', today: '今天', yesterday: '昨天', week: '本周', month: '本月', lastmonth: '上月', all: '全部', custom: '指定时间' };
+function rngCustomWindow() {
+  const f = $('rng_from').value, t = $('rng_to').value;
+  return { since: f ? new Date(f).getTime() : null, until: t ? new Date(t).getTime() : null };
+}
+function rangeWindow(key, now) {
+  const d0 = new Date(); d0.setHours(0, 0, 0, 0);
+  const s0 = d0.getTime();
+  switch (key) {
+    case '1h': return { since: now - 3600e3, until: now };
+    case '5h': return { since: now - 5 * 3600e3, until: now };
+    case '24h': return { since: now - 24 * 3600e3, until: now };
+    case 'today': return { since: s0, until: s0 + DAY };              // 整天 00:00 → 次日 00:00
+    case 'yesterday': return { since: s0 - DAY, until: s0 };
+    case 'week': { const w = new Date(s0); w.setDate(w.getDate() - ((w.getDay() + 6) % 7)); return { since: w.getTime(), until: now }; }   // 本周一 00:00 起
+    case 'month': return { since: new Date(d0.getFullYear(), d0.getMonth(), 1).getTime(), until: now };
+    case 'lastmonth': return { since: new Date(d0.getFullYear(), d0.getMonth() - 1, 1).getTime(), until: new Date(d0.getFullYear(), d0.getMonth(), 1).getTime() };
+    case 'custom': return rngCustomWindow();
+    default: return { since: null, until: null };                     // all = 不限时间（全部历史）
+  }
+}
+function fmtDT(ts) {
+  const d = new Date(ts), p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function syncRange() {
+  document.querySelectorAll('#rangebar .rbtn').forEach(b => b.classList.toggle('on', b.dataset.rng === RANGE));
+  $('rng_custom').classList.toggle('hidden', RANGE !== 'custom');
+}
+function rangeQuery() {
+  const w = rangeWindow(RANGE, Date.now());
+  const p = ['tz=' + (-new Date().getTimezoneOffset())];
+  if (w.since != null) p.push('since=' + w.since);
+  if (w.until != null) p.push('until=' + w.until);
+  return p.join('&');
+}
+function rangeInfoText(d) {
+  const w = rangeWindow(RANGE, Date.now());
+  const win = RANGE === 'all' ? '不限时间（全部历史）'
+    : `${w.since != null ? fmtDT(w.since) : '不限'} → ${w.until != null ? fmtDT(w.until) : '不限'}`;
+  const seg = [`口径 ${RANGE_NAME[RANGE] || RANGE}`, win];
+  if (d.range) seg.push(`命中 ${d.range.matched} 条 · ${d.range.segs} 段查询`);
+  if (d.storage) seg.push(`存储 SQLite ${fmt(d.storage.rows)} 条 / ${fmtB(d.storage.db_bytes)} · json 滚动 ${d.storage.json_days} 天`);
+  return `<span class="dim">${esc(seg.join(' · '))}</span>`;
+}
+try {   // 恢复上次的自定义时间段
+  const c = JSON.parse(localStorage.getItem('gw_range_custom') || 'null');
+  if (c) { $('rng_from').value = c.from || ''; $('rng_to').value = c.to || ''; }
+} catch { }
+document.querySelectorAll('#rangebar .rbtn').forEach(b => b.onclick = () => {
+  RANGE = b.dataset.rng; localStorage.setItem('gw_range', RANGE); syncRange(); refreshStats();
+});
+$('rng_apply').onclick = () => {
+  const w = rngCustomWindow();
+  if (w.since == null && w.until == null) { toast('请先填起始或结束时间', 1); return; }
+  if (w.since != null && w.until != null && w.since > w.until) { toast('起始时间晚于结束时间', 1); return; }
+  RANGE = 'custom';
+  localStorage.setItem('gw_range', RANGE);
+  localStorage.setItem('gw_range_custom', JSON.stringify({ from: $('rng_from').value, to: $('rng_to').value }));
+  syncRange(); refreshStats();
+};
+
+/* ---------- 用量统计 ---------- */
+async function refreshStats() {
+  if (TAB !== 'stats') return;
+  try { STATS = await api('/api/stats?' + rangeQuery()); }
+  catch (e) { $('status').textContent = e.message; $('dot').className = 'dot bad'; return; }
+  const d = STATS;
+  $('dot').className = 'dot ok';
+  if (d.config && typeof d.config.enabled === 'boolean') { ENABLED = d.config.enabled; renderToggle(); }
+  if (d.config && d.config.capture) renderCap(d.config.capture);
+  $('status').innerHTML = `<span class="green">在线</span> <span class="dim">${esc(d.config.listen?.host)}:${d.config.listen?.port}</span>`;
+  const t = d.totals;
+  $('t_req').textContent = fmt(t.requests);
+  $('t_err').textContent = d.errors;
+  $('t_up').textContent = (() => { const s = d.uptime_s;
+    return s >= 3600 ? Math.floor(s / 3600) + 'h' + Math.floor(s % 3600 / 60) + 'm'
+      : s >= 60 ? Math.floor(s / 60) + 'm' + (s % 60) + 's' : s + 's'; })();
+  $('t_tok').textContent = fmt(t.in) + ' / ' + fmt(t.out);
+  $('t_reason').textContent = fmt(t.reasoning);
+  $('t_hit').innerHTML = `<span class="${hitCls(t.hit)}">${t.hit}%</span>`;
+  $('t_cached').textContent = fmt(t.cached);
+  $('t_in').textContent = fmt(t.in);
+  $('t_lat').textContent = ms(t.avg_ttft) + ' / ' + ms(t.avg_ms);
+  $('t_lat_s').textContent = t.requests ? `${t.requests} 次请求的均值` : '暂无数据';
+  $('t_bytes').innerHTML = `<span class="cyan">${fmtB(t.bytes_in)}</span> <span class="dim">/</span> <span class="amber">${fmtB(t.bytes_out)}</span>`;
+  $('t_bres').textContent = fmtB(t.bytes_res);
+
+  const ser = (d.series && d.series.length) ? d.series : (d.last24h || []);   // 兜底：旧版后端没有 series 时退回滚动 24 小时
+  const isDay = d.bucket === 'day';
+  const max = Math.max(1, ...ser.map(x => x.in));
+  const labAxis = (ts) => isDay
+    ? new Date(ts).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
+    : new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+  const labTip = (ts) => isDay
+    ? new Date(ts).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
+    : new Date(ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false });
+  $('chart_title').textContent = (isDay ? '每日' : '每小时') + '输入 tokens';
+  $('chart_sub').textContent = `${RANGE_NAME[RANGE] || ''} · ${ser.length} 桶 · 按本地时间`.replace(/^ · /, '');
+  $('range_info').innerHTML = rangeInfoText(d);
+  $('bar').style.gap = ser.length > 90 ? '1px' : '2px';
+  $('bar').innerHTML = ser.map(x =>
+    `<div class="col" style="height:${Math.max(2, x.in / max * 100)}%" title="${labTip(x.ts)}${isDay ? '' : ' 这一小时'}\n输入 ${fmt(x.in)} · 输出 ${fmt(x.out)} · ${x.requests} 次 · 命中 ${x.in ? (x.cached / x.in * 100).toFixed(0) : 0}%"></div>`).join('');
+  const astep = Math.max(1, Math.ceil(ser.length / 6));
+  $('axis').innerHTML = ser.filter((_, i) => i % astep === 0).map(x => `<span>${labAxis(x.ts)}</span>`).join('') || '<span>暂无数据</span>';
+  $('h24s').textContent = `峰值 ${fmt(max)} tokens/${isDay ? '天' : 'h'}`;
+
+  const H9 = ['请求', '输入', '输出', '字节(↑/↓)', '缓存', '命中', 'TTFT', '总时长', '推理'];   // 第 0 列是名称，各表不同
+  const head = (name) => [name, ...H9];
+  const rowsOf = (o) => {
+    const ent = Object.entries(o);
+    return {
+      rows: ent.map(([k, v]) => [esc(k), fmt(v.requests), fmt(v.in), fmt(v.out), `${fmtB(v.bytes_in)} / ${fmtB(v.bytes_out)}`, fmt(v.cached),
+        hitCell(v), ms(v.avg_ttft), ms(v.avg_ms), fmt(v.reasoning)]),
+      vals: ent.map(([k, v]) => [k, v.requests || 0, v.in || 0, v.out || 0, v.cached || 0,
+        v.in ? v.cached / v.in : 0, v.avg_ttft || 0, v.avg_ms || 0, v.reasoning || 0]),
+    };
+  };
+  const mM = rowsOf(d.by_model); table($('tbl_model'), head('模型'), mM.rows, '', mM.vals, [0]);
+  $('pv_n').textContent = `${Object.keys(d.by_provider).length} 个上游`;
+  $('k_n').textContent = `${Object.keys(d.by_key).length} 个 key`;
+  const mP = rowsOf(d.by_provider); table($('tbl_provider'), head('上游'), mP.rows, '', mP.vals, [0]);
+  const mK = rowsOf(d.by_key); table($('tbl_key'), head('key'), mK.rows, '', mK.vals, [0]);
+  if (SUB === 'recent' && !reqFilterActive() && REQ_PAGE === 1) loadRequests();   // 无筛选且在第 1 页时跟随自动刷新
+}
+
+/* ---------- 最近请求：筛选 + 查询历史 ---------- */
+const REQ_HEAD = ['时间', 'IP', 'key', '模型', '状态', 'TTFT/总耗时', '入/出', '字节(↑请求 ↓响应)', '命中', '工具'];
+function renderReqRows(items) {
+  table($('tbl_recent'), REQ_HEAD, items.map(r => [
+    new Date(r.ts).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+    `<span class="dim">${esc(r.ip || '-')}</span>`, esc(r.key),
+    esc(r.model) + ((r.model && r.upstream_model && !String(r.model).endsWith('/' + r.upstream_model))   // 上游名通常＝模型名去掉前缀，只有真别名时才附上
+      ? ` <span class="dim">→ ${esc(r.upstream_model)}</span>` : ''),
+    r.status >= 400 ? `<span class="red">${r.status}</span>` : `<span class="green">${r.status}</span>`,
+    `${ms(r.ttft_ms)} / ${ms(r.ms)}`,
+    `${fmt(r.usage?.in || 0)} / ${fmt(r.usage?.out || 0)}`,
+    `<span class="cyan">${fmtB(r.req_bytes)}</span> <span class="dim">/</span> <span class="amber">${fmtB(r.up_res_bytes)}</span>`,
+    hitCell(r.usage, r),
+    r.has_tool ? '<span class="violet">✓</span>' : '']), '没有匹配的请求', null, [[1, 13], [3, 30], [7, 22]], 0);
+}
+function dtLocalStr(ms) {
+  const d = new Date(ms), p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function reqFilterActive() {
+  return !!($('f_model').value || $('f_key').value || $('f_ip').value.trim() || $('f_status').value || $('f_from').value || $('f_to').value);
+}
+let REQ_PAGE = 1, REQ_PAGES = 1;
+function reqPageSize() { return Number($('f_limit').value) || 50; }
+function reqQueryBody() {
+  const body = {
+    model: $('f_model').value, key: $('f_key').value, ip: $('f_ip').value.trim(), status: $('f_status').value,
+    limit: reqPageSize(), offset: (REQ_PAGE - 1) * reqPageSize(),
+  };
+  if ($('f_from').value) body.since = new Date($('f_from').value).getTime();
+  if ($('f_to').value) body.until = new Date($('f_to').value).getTime();
+  return body;
+}
+async function loadRequests(page) {
+  if (page) REQ_PAGE = page;
+  let d;
+  try { d = await api('/api/stats/requests', reqQueryBody()); }
+  catch (e) { $('f_info').innerHTML = `<span class="red">查询失败：${esc(e.message)}</span>`; return; }
+  REQ_PAGES = Math.max(1, Math.ceil(d.total / reqPageSize()));
+  if (REQ_PAGE > REQ_PAGES) { REQ_PAGE = REQ_PAGES; return loadRequests(); }   // 页码越界（如改了每页条数）
+  const keepList = (id, list, all) => {
+    const el = $(id), cur = el.value;
+    el.innerHTML = `<option value="">${all}</option>` + list.map(v => `<option value="${esc(v)}">${esc(v)}</option>`).join('');
+    if (list.map(String).includes(cur)) el.value = cur;
+  };
+  keepList('f_model', d.options.models, '全部模型');
+  keepList('f_key', d.options.keys, '全部 key');
+  const st = $('f_status'), curSt = st.value;
+  st.innerHTML = '<option value="">全部状态</option><option value="ok">成功 (2xx)</option><option value="err">错误 (≥400)</option>' +
+    d.options.statuses.map(s => `<option value="${s}">${s}</option>`).join('');
+  st.value = curSt;
+
+  const size = reqPageSize(), from = (REQ_PAGE - 1) * size + 1, to = (REQ_PAGE - 1) * size + d.shown;
+  $('recs').textContent = `共 ${d.total} 条 · 本页 ${d.shown} 条 · ${d.source === 'db' ? 'SQLite' : d.source === 'memory' ? '内存' : '历史文件'}${d.truncated ? '（文件过大，仅扫末尾）' : ''}`;
+  $('f_pageno').textContent = `第 ${REQ_PAGE} / ${REQ_PAGES} 页`;
+  $('f_pagesize_hint').textContent = d.total ? `第 ${from}–${to} 条` : '';
+  const when = [$('f_from').value ? '从 ' + $('f_from').value.replace('T', ' ') : '', $('f_to').value ? '到 ' + $('f_to').value.replace('T', ' ') : ''].filter(Boolean).join(' ');
+  $('f_info').innerHTML = `<span class="dim">${when ? esc(when) : '未限定时间'} · 可选 ${d.options.models.length} 模型 / ${d.options.keys.length} key / ${d.options.ips.length} IP</span>`;
+  renderReqRows(d.items);
+
+  document.querySelector('[data-page="first"]').disabled = REQ_PAGE <= 1;
+  document.querySelector('[data-page="prev"]').disabled = REQ_PAGE <= 1;
+  document.querySelector('[data-page="next"]').disabled = REQ_PAGE >= REQ_PAGES;
+  document.querySelector('[data-page="last"]').disabled = REQ_PAGE >= REQ_PAGES;
+}
+document.querySelectorAll('[data-page]').forEach(b => b.onclick = () => {
+  const p = b.dataset.page;
+  const next = p === 'first' ? 1
+    : p === 'last' ? REQ_PAGES
+      : p === 'prev' ? Math.max(1, REQ_PAGE - 1)
+        : Math.min(REQ_PAGES, REQ_PAGE + 1);
+  if (next !== REQ_PAGE) loadRequests(next);
+});
+$('f_apply').onclick = () => loadRequests(1);
+$('f_ip').addEventListener('keydown', e => { if (e.key === 'Enter') loadRequests(1); });
+$('f_limit').onchange = () => loadRequests(1);
+$('f_reset').onclick = () => {
+  ['f_model', 'f_key', 'f_status'].forEach(i => $(i).value = '');
+  $('f_ip').value = ''; $('f_from').value = ''; $('f_to').value = ''; $('f_limit').value = '50';
+  loadRequests(1);
+};
+document.querySelectorAll('[data-range]').forEach(b => b.onclick = () => {
+  const r = b.dataset.range, now = Date.now();
+  if (r === 'all') { $('f_from').value = ''; $('f_to').value = ''; }
+  else if (r === 'today') {
+    // 今天 = 当日 00:00 ~ 24:00（整天），而不是"从 00:00 到现在"
+    const d = new Date(); d.setHours(0, 0, 0, 0);
+    const end = new Date(d.getTime()); end.setDate(end.getDate() + 1);   // 次日 00:00；后端用 ts > until 过滤，等于含到当日 23:59:59.999
+    $('f_from').value = dtLocalStr(d.getTime());
+    $('f_to').value = dtLocalStr(end.getTime());
+  } else {
+    const start = r === '1h' ? now - 3600e3
+      : r === '24h' ? now - 86400e3
+        : now - 7 * 86400e3;                                             // 7d
+    $('f_from').value = dtLocalStr(start);
+    $('f_to').value = dtLocalStr(now);
+  }
+  loadRequests(1);
+});
+
+/* ---------- 配置 ---------- */
+async function loadConfig(force) {
+  if (CONF && !force) return CONF;
+  try { CONF = await api('/api/config'); } catch (e) { toast('读取配置失败：' + e.message, 1); }
+  return CONF;
+}
+const FMT_LABEL = { chat: 'chat', responses: 'responses', messages: 'messages' };
+function fmtCell(m) {
+  const cls = m.format === 'messages' ? 'violet' : m.format === 'responses' ? 'cyan' : 'amber';
+  return `<span class="${cls}">${FMT_LABEL[m.format] || '-'}</span>${m.auto ? ' <span class="pill">自动</span>' : ''}`;
+}
+
+function renderModels() {
+  if (!CONF) return;
+  const q = ($('m_search').value || '').toLowerCase();
+  const pf = $('m_filter').value;
+  $('m_filter').innerHTML = '<option value="">全部供应商</option>' + CONF.providers.map(p =>
+    `<option value="${esc(p.name)}">${esc(p.name)}${p.prefix ? '（' + esc(p.prefix) + '/）' : ''}</option>`).join('');
+  $('m_filter').value = pf;
+  const rows = CONF.models.filter(m => (!q || m.id.toLowerCase().includes(q) || String(m.provider || '').toLowerCase().includes(q) || String(m.format || '').includes(q))
+    && (!pf || m.provider === pf));
+  $('m_count').textContent = `${rows.length} / ${CONF.models.length} 个`;
+  table($('tbl_models'), ['模型', '供应商', '协议', '请求', '输入', '输出', '命中', '操作'],
+    rows.map(m => [esc(m.id), esc(m.provider || '-'), fmtCell(m), fmt(m.requests), fmt(m.in), fmt(m.out),
+      m.in ? `<span class="${hitCls(m.cached / m.in * 100)}">${(m.cached / m.in * 100).toFixed(0)}%</span>` : '<span class="dim">—</span>',
+      `<button class="act danger" data-del="${esc(m.id)}">删除</button>`]), '没有匹配的模型', null, [0]);
+  document.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+    if (!confirm('从网关模型列表移除 ' + b.dataset.del + '？（不影响上游本身）')) return;
+    try { const r = await api('/api/config/model/delete', { id: b.dataset.del }); CONF = r.config; toast('已移除 ' + b.dataset.del); renderModels(); }
+    catch (e) { toast('失败：' + e.message, 1); }
+  });
+}
+$('m_search').oninput = renderModels;
+$('m_filter').onchange = renderModels;
+
+function renderProviders() {
+  if (!CONF) return;
+  table($('tbl_providers'), ['供应商', 'Base URL', '前缀', 'key', '模型数', '操作'],
+    CONF.providers.map(p => [`${esc(p.name)}${p.reasoning_echo ? ' <span class="pill" title="reasoning_echo：保思维链">回灌</span>' : ''}`, `<span class="dim">${esc(p.base_url)}</span>`, esc(p.prefix || '-'),
+      p.has_key ? '<span class="green">已设置</span>' : '<span class="red">未设置</span>',
+      p.models, `<button class="act" data-editp="${esc(p.name)}">编辑</button> ` +
+      `<button class="act danger" data-delp="${esc(p.name)}">删除</button>`]), '还没有供应商', null, [1]);
+  document.querySelectorAll('[data-editp]').forEach(b => b.onclick = () => startEditProvider(b.dataset.editp));
+  document.querySelectorAll('[data-delp]').forEach(b => b.onclick = async () => {
+    const name = b.dataset.delp;
+    const p = CONF.providers.find(x => x.name === name) || {};
+    if (!confirm(`删除供应商「${name}」？\n\n会同时移除：\n· 它的 ${p.models ?? 0} 个模型（前缀 ${p.prefix || '-'}/）\n· 对应路由与协议记忆\n· .env 里的 key（若没有别的供应商共用）\n\n配置会先自动备份。`)) return;
+    try {
+      const r = await api('/api/config/provider/delete', { name });
+      CONF = r.config;
+      toast(`已删除 ${r.removed_provider}：模型 ${r.removed_models} 个、路由 ${r.removed_routes} 条${r.env_removed ? '、key 已从 .env 移除' : ''}`);
+      renderProviders();
+    } catch (e) { toast('失败：' + e.message, 1); }
+  });
+}
+/* ---- 编辑已有供应商 ---- */
+let EDIT_NAME = null, UA_ORIG = '', HDR_ORIG = '';
+function resetProviderForm() {
+  EDIT_NAME = null; UA_ORIG = ''; HDR_ORIG = '';
+  ['p_name', 'p_prefix', 'p_url', 'p_env', 'p_ua', 'p_hdr', 'p_key'].forEach(id => { $(id).value = ''; $(id).disabled = false; });
+  $('p_echo').checked = false;
+  $('p_key').placeholder = 'sk-...';
+  $('p_title').textContent = '新增 / 覆盖供应商';
+  $('p_submit').textContent = '保存供应商';
+  $('p_cancel').style.display = 'none';
+  $('p_editinfo').classList.add('hidden');
+}
+$('p_cancel').onclick = () => { resetProviderForm(); toast('已退出编辑'); };
+async function startEditProvider(name) {
+  try {
+    const d = await api('/api/config/provider/detail', { name });
+    EDIT_NAME = d.name; UA_ORIG = d.user_agent || '';
+    HDR_ORIG = d.extra_headers && Object.keys(d.extra_headers).length ? JSON.stringify(d.extra_headers) : '';
+    $('p_name').value = d.name; $('p_name').disabled = true;
+    $('p_prefix').value = d.prefix || ''; $('p_prefix').disabled = true;
+    $('p_url').value = d.base_url || '';
+    $('p_env').value = d.api_key_env || '';
+    $('p_key').value = ''; $('p_key').placeholder = d.has_key ? '已设置，留空即不改' : '未设置，填一个';
+    $('p_ua').value = UA_ORIG;
+    $('p_hdr').value = HDR_ORIG;
+    $('p_echo').checked = !!d.reasoning_echo;
+    $('p_title').textContent = '编辑供应商：' + d.name;
+    $('p_submit').textContent = '保存修改';
+    $('p_cancel').style.display = '';
+    $('p_editinfo').innerHTML = `正在编辑 <span class="amber">${esc(d.name)}</span>（前缀 <span class="dim">${esc(d.prefix || '-')}/</span>，模型 ${d.models} 个）——` +
+      `名称与前缀不可改（改名＝删除后重建）；key 留空即保持不变。`;
+    $('p_editinfo').classList.remove('hidden');
+    document.querySelector('#tab-providers').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (e) { toast('读取失败：' + e.message, 1); }
+}
+$('p_submit').onclick = async () => {
+  let extra = null;
+  const hdr = $('p_hdr').value.trim();
+  if (hdr) { try { extra = JSON.parse(hdr); } catch { return toast('额外请求头不是合法 JSON', 1); } }
+  try {
+    if (EDIT_NAME) {
+      const ua = $('p_ua').value.trim();
+      if (!ua && UA_ORIG && !confirm(`清空「${EDIT_NAME}」的 User-Agent？\n\n部分上游（带 Cloudflare 前置的）会直接 403 error 1010，确认清空？`)) return;
+      if (!hdr && HDR_ORIG && !confirm(`清空「${EDIT_NAME}」的额外请求头？\n\n原值：${HDR_ORIG}\n确认清空？`)) return;
+      const r = await api('/api/config/provider/update', {
+        name: EDIT_NAME, base_url: $('p_url').value.trim(),
+        api_key: $('p_key').value.trim(), api_key_env: $('p_env').value.trim(),
+        user_agent: ua, extra_headers: extra || {}, reasoning_echo: $('p_echo').checked,
+      });
+      CONF = r.config;
+      toast(`已更新 ${r.provider}：${(r.changed || []).join('、') || '无变化'}`);
+      resetProviderForm(); renderProviders();
+      return;
+    }
+    const r = await api('/api/config/provider', {
+      name: $('p_name').value.trim(), prefix: $('p_prefix').value.trim(), base_url: $('p_url').value.trim(),
+      api_key: $('p_key').value.trim(), api_key_env: $('p_env').value.trim(),
+      user_agent: $('p_ua').value.trim(), extra_headers: extra, reasoning_echo: $('p_echo').checked,
+    });
+    CONF = r.config;
+    resetProviderForm();
+    toast(`已保存 ${r.provider}（前缀 ${r.prefix}/，key 变量 ${r.api_key_env}）`);
+    renderProviders();
+  } catch (e) { toast('失败：' + e.message, 1); }
+};
+/* ---- 拉取上游模型列表 → 勾选批量添加 ---- */
+let FETCHED = [], FETCH_PREFIX = '';
+async function doFetch() {
+  const prefix = $('mm_prefix').value.trim().replace(/\/+$/, '');
+  if (!prefix) return toast('先填前缀', 1);
+  FETCH_PREFIX = prefix;
+  $('mm_status').innerHTML = '<span class="amber">正在请求上游 /models …</span>';
+  $('mm_panel').classList.add('hidden');
+  try {
+    const r = await api('/api/config/provider/models', { prefix });
+    FETCHED = r.models || [];
+    const had = FETCHED.filter(m => m.added).length;
+    $('mm_status').innerHTML = `供应商 <span class="amber">${esc(r.provider)}</span> · <span class="dim">${esc(r.endpoint)}</span> 拉到 <span class="green">${r.count}</span> 个（其中 <span class="amber">${had}</span> 个已在列表）`;
+    $('mm_panel').classList.remove('hidden');
+    $('mm_search').value = '';
+    renderFetched();
+  } catch (e) {
+    $('mm_status').innerHTML = `<span class="red">获取失败：${esc(e.message)}</span>`;
+    toast('获取失败：' + e.message, 1);
+  }
+}
+function updSel() { $('mm_selinfo').textContent = `已选 ${selIds().length}`; }
+function selIds() { return [...$('mm_list').querySelectorAll('input[type=checkbox]:checked')].map(c => c.dataset.id); }
+function renderFetched() {
+  const q = ($('mm_search').value || '').toLowerCase();
+  const list = FETCHED.filter(m => !q || m.id.toLowerCase().includes(q));
+  $('mm_list').innerHTML = list.length
+    ? list.map(m => `<label style="display:flex;gap:8px;align-items:center;padding:3px 4px">
+        <input type="checkbox" data-id="${esc(m.id)}" ${m.added ? '' : 'checked'} style="width:auto">
+        <span class="${m.added ? 'dim' : ''}">${esc(m.id)}</span>${m.added ? '<span class="pill">已添加</span>' : ''}</label>`).join('')
+    : '<div class="msg">无匹配</div>';
+  $('mm_list').querySelectorAll('input[type=checkbox]').forEach(c => c.onchange = updSel);
+  updSel();
+}
+$('mm_fetch').onclick = doFetch;
+$('mm_prefix').addEventListener('keydown', e => { if (e.key === 'Enter') doFetch(); });
+$('mm_search').oninput = renderFetched;
+$('mm_all').onclick = () => { $('mm_list').querySelectorAll('input[type=checkbox]').forEach(c => c.checked = true); updSel(); };
+$('mm_none').onclick = () => { $('mm_list').querySelectorAll('input[type=checkbox]').forEach(c => c.checked = false); updSel(); };
+$('mm_bulkadd').onclick = async () => {
+  const ids = selIds();
+  if (!ids.length) return toast('没有勾选模型', 1);
+  try {
+    const r = await api('/api/config/models/bulk', { prefix: FETCH_PREFIX || $('mm_prefix').value.trim(), ids, format: $('mm_bulkfmt').value });
+    CONF = r.config;
+    toast(`已添加 ${r.added} 个${r.skipped ? `（${r.skipped} 个已存在）` : ''}，列表共 ${r.total} 个`);
+    await doFetch();
+    renderProviders();
+  } catch (e) { toast('失败：' + e.message, 1); }
+};
+
+$('mm_submit').onclick = async () => {
+  try {
+    const r = await api('/api/config/model', { prefix: $('mm_prefix').value.trim(), id: $('mm_id').value.trim(), format: $('mm_fmt').value });
+    CONF = r.config; toast('已添加 ' + r.added); $('mm_id').value = ''; renderProviders();
+  } catch (e) { toast('失败：' + e.message, 1); }
+};
+
+async function renderKeys() {
+  if (!CONF) return;
+  let st = {};
+  try { st = (await api('/api/stats')).by_key || {}; } catch { }
+  table($('tbl_keys'), ['key', 'key 值', '协议', '请求', '输入', '输出', '字节(↑/↓)', '命中', '操作'],
+    CONF.keys.map(k => { const v = st[k.name] || {};
+      return [esc(k.name),
+        `<span data-keycell="${esc(k.name)}" class="dim" style="word-break:break-all">sk-gw-••••••••••••</span>`,
+        `<select data-kproto="${esc(k.name)}">` + ['', 'chat', 'responses', 'messages'].map(p =>
+          `<option value="${p}"${(k.protocol || '') === p ? ' selected' : ''}>${p || '自动'}</option>`).join('') + '</select>',
+        fmt(v.requests || 0), fmt(v.in || 0), fmt(v.out || 0), `${fmtB(v.bytes_in)} / ${fmtB(v.bytes_out)}`, hitCell(v),
+        `<button class="act" data-rev="${esc(k.name)}">显示</button> ` +
+        `<button class="act" data-copy="${esc(k.name)}">复制</button> ` +
+        `<button class="act danger" data-delk="${esc(k.name)}">删除</button>`]; }), '还没有 key', null, [1]);
+  document.querySelectorAll('[data-kproto]').forEach(s => s.onchange = async () => {
+    try {
+      const r = await api('/api/config/key/protocol', { name: s.dataset.kproto, protocol: s.value });
+      CONF = r.config;
+      toast(`key ${r.key} 的协议：${r.protocol || '自动（按客户端实际用法）'}`);
+      renderKeys();
+    } catch (e) { toast('失败：' + e.message, 1); }
+  });
+  document.querySelectorAll('[data-rev]').forEach(b => b.onclick = async () => {
+    const name = b.dataset.rev;
+    const cell = document.querySelector(`[data-keycell="${name}"]`);
+    if (cell.dataset.shown === '1') {
+      cell.textContent = 'sk-gw-••••••••••••'; cell.className = 'dim'; cell.dataset.shown = '0'; b.textContent = '显示';
+      return;
+    }
+    try {
+      const r = await api('/api/config/key/reveal', { name });
+      cell.textContent = r.key; cell.className = 'cyan'; cell.dataset.shown = '1'; b.textContent = '隐藏';
+    } catch (e) { toast('显示失败：' + e.message, 1); }
+  });
+  document.querySelectorAll('[data-copy]').forEach(b => b.onclick = async () => {
+    const name = b.dataset.copy;
+    try {
+      const r = await api('/api/config/key/reveal', { name });
+      if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(r.key); toast('已复制 ' + name + ' 的 key'); }
+      else { const cell = document.querySelector(`[data-keycell="${name}"]`); cell.textContent = r.key; cell.className = 'cyan'; cell.dataset.shown = '1'; toast('剪贴板不可用，已显示出来手动复制'); }
+    } catch (e) { toast('复制失败：' + e.message, 1); }
+  });
+  document.querySelectorAll('[data-delk]').forEach(b => b.onclick = async () => {
+    const name = b.dataset.delk;
+    if (!confirm(`删除客户端 key「${name}」？\n\n用这个 key 的客户端（各客户端）会立刻 401，需要换 key。\n配置会先自动备份。`)) return;
+    try {
+      const r = await api('/api/config/key/delete', { name });
+      CONF = r.config;
+      toast(`已删除 key ${r.removed_key}，剩 ${r.left} 个`);
+      renderKeys();
+    } catch (e) { toast('失败：' + e.message, 1); }
+  });
+}
+$('k_submit').onclick = async () => {
+  try {
+    const r = await api('/api/config/key', { name: $('k_name').value.trim() });
+    CONF = r.config;
+    $('k_out').innerHTML = `已生成（只显示这一次，请立刻保存）：<br><code>${esc(r.name)} = ${esc(r.key)}</code>`;
+    toast('已生成 key ' + r.name);
+    $('k_name').value = '';
+    renderKeys();
+  } catch (e) { toast('失败：' + e.message, 1); }
+};
+
+/* ---------- 上游额度：上游余额 + 用量估算 ---------- */
+const usd = (n) => '$' + Number(n || 0).toFixed(n >= 1 ? 2 : 4);
+const pctCls = (p) => p >= 80 ? 'red' : p >= 50 ? 'amber' : 'green';
+const resetAt = (iso) => iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-';
+async function renderQuota(force) {
+  try {
+    const d = await api('/api/upstream/quota' + (force ? '?refresh=1' : ''));
+    const ds = d.balance || {}, go = d.usage || {}, w = go.windows || {}, rq = w.reqs || {}, q = go.quota || {};
+    const dsCell = ds.ok
+      ? `<span class="green">${ds.currency === 'CNY' ? '¥' : '$'}${Number(ds.total || 0).toFixed(2)}</span> <span class="dim" style="font-size:calc(var(--fs)*0.78)">赠送 ${Number(ds.granted || 0).toFixed(2)} / 充值 ${Number(ds.topped_up || 0).toFixed(2)}</span>`
+      : `<span class="red">读取失败</span> <span class="dim" style="font-size:calc(var(--fs)*0.78)">${esc(ds.error || '')}</span>`;
+    const qItem = (label, o) => o
+      ? `<span class="${pctCls(o.percent)}">${o.percent}%</span><span class="dim" style="font-size:calc(var(--fs)*0.75)"> ${label}·${resetAt(o.resets_at)}重置</span>`
+      : `<span class="dim">${label} —</span>`;
+    const goCell = q.ok
+      ? `${qItem('5小时', q.rolling)} &nbsp;·&nbsp; ${qItem('本周', q.weekly)} &nbsp;·&nbsp; ${qItem('本月', q.monthly)}`
+      : `<span class="red">读取失败</span> <span class="dim" style="font-size:calc(var(--fs)*0.78)">${esc(q.error || '')}</span>`;
+    const rows = (go.models || []).filter(m => m.d30 > 0 || m.h5 > 0);
+    $('quota').innerHTML = `<div class="grid2" style="margin-bottom:8px">
+        <div><div class="dim" style="font-size:calc(var(--fs)*0.85)">上游余额</div>
+          <div style="font-size:calc(var(--fs)*1.45)">${dsCell}</div></div>
+        <div><div class="dim" style="font-size:calc(var(--fs)*0.85)">上游额度（已用 / 各窗口独立重置）</div>
+          <div style="font-size:calc(var(--fs)*1.45)">${goCell}</div></div>
+      </div>
+      <div class="dim" style="font-size:calc(var(--fs)*0.85)">网关侧明细：5 小时 <span class="amber">${usd(w.h5)}</span> · 本周 <span class="amber">${usd(w.w7)}</span> · 30 天 <span class="amber">${usd(w.d30)}</span>
+        <span style="font-size:calc(var(--fs)*0.78)">（${rq.h5 || 0} / ${rq.w7 || 0} / ${rq.d30 || 0} 次）</span></div>`
+      + (rows.length ? '<div class="tblwrap" style="margin-top:6px"><table id="tbl_quota"></table></div>' : '')
+      + `<div class="hint" style="margin-top:6px">${esc(go.detail_note || '')}</div>`;
+    if (rows.length) {
+      table($('tbl_quota'), ['模型', '5 小时', '本周', '30 天', '月上限', '月占比'],
+        rows.map(m => [esc(m.model), usd(m.h5), usd(m.w7), usd(m.d30),
+          m.cap ? '$' + m.cap : (/-free$/.test(m.model) ? '<span class="green">免费</span>' : '<span class="dim">未计价</span>'),
+          m.cap ? `<span class="${hitCls(m.d30 / m.cap * 100)}">${(m.d30 / m.cap * 100).toFixed(1)}%</span>` : '—']),
+        '暂无', null, [0], 22);
+    }
+    $('q_at').textContent = '更新于 ' + new Date(d.ts).toLocaleTimeString('zh-CN', { hour12: false });
+  } catch (e) { $('quota').innerHTML = `<span class="red">读取失败：${esc(e.message)}</span>`; }
+}
+$('q_refresh').onclick = () => renderQuota(true);
+
+/* ---------- 启动 ---------- */
+syncSub();
+syncRange();
+renderToggle();
+renderCap();
+refreshStats();
+loadConfig(true);
+renderQuota();
+setInterval(refreshStats, 2000);
+setInterval(renderQuota, 60000);
+setInterval(() => {
+  if (TAB === 'stats') return;
+  loadConfig(true).then(() => {
+    if (TAB === 'models') renderModels();
+    if (TAB === 'providers') renderProviders();
+    if (TAB === 'keys') renderKeys();
+  });
+}, 10000);
+</script>
+</body>
+</html>

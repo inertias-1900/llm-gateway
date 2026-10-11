@@ -1,0 +1,65 @@
+{
+  "listen": { "host": "0.0.0.0", "port": 8010 },
+  "enabled": true,
+  "capture": false,
+
+  "keys": [
+    { "name": "client-a", "key": "sk-gw-REPLACE_ME", "session_id": "00000000-0000-0000-0000-000000000001" }
+  ],
+
+  "providers": {
+    "upstream-a": {
+      "base_url": "https://api.upstream-a.example.com/v1",
+      "api_key_env": "UPSTREAM_A_KEY",
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+      "extra_headers": {},
+      "thinking_style": "none",
+      "reasoning_echo": false
+    },
+    "upstream-b": {
+      "base_url": "https://api.upstream-b.example.com/v1",
+      "api_key_env": "UPSTREAM_B_KEY",
+      "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    }
+  },
+
+  "routes": [
+    {
+      "model_regex": "^a/",
+      "provider": "upstream-a",
+      "strip": "a/",
+      "format": "auto",
+      "responses_regex": "^(gpt-|grok-)"
+    },
+    {
+      "model_regex": "^b/",
+      "provider": "upstream-b",
+      "strip": "b/",
+      "format": "chat"
+    }
+  ],
+
+  "models": ["a/some-model", "b/another-model"],
+
+  "model_formats": {
+    "upstream-a|some-model": "responses"
+  },
+
+  "dashboard_auth": {
+    "hosts": []
+  },
+
+  "prices": {
+    "some-model": { "in": 0.1, "out": 0.5, "cached": 0.01, "cap": null }
+  },
+
+  "peak_prices": {
+    "another-model": { "cap": 60, "peak": [0.3, 1.2, 0.006], "off": [0.15, 0.6, 0.003] }
+  },
+
+  "quota": {
+    "provider_prefixes": ["a/", "b/"],
+    "balance": { "url": "", "api_key_env": "" },
+    "usage": { "url": "", "api_key_env": "" }
+  }
+}

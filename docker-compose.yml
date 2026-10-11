@@ -1,0 +1,13 @@
+services:
+  gateway:
+    image: node:24-alpine            # 需要 Node ≥ 22.5（内置 node:sqlite）
+    container_name: llm-gateway
+    entrypoint: ["node", "/gw/server.mjs"]
+    working_dir: /gw
+    volumes:
+      - ./:/gw
+    env_file:
+      - ./.env
+    ports:
+      - "127.0.0.1:8010:8010"        # 只绑本机；对外交给反代/隧道
+    restart: unless-stopped
