@@ -350,6 +350,12 @@ function queryRequests(q) {
 }
 
 // ---------------- 统计快照（给看板） ----------------
+// 生成速度（token/s）：输出 token ÷ 生成耗时。生成耗时 = 总耗时 − 首字延迟（TTFT）；
+// 非流式没有 TTFT（记 0），退化为总耗时。无输出或耗时为 0 时记 0（避免 Infinity）。
+function tpsOf(out, ms, ttft) {
+    const o = Number(out) || 0, gen = (Number(ms) || 0) - (Number(ttft) || 0);
+    return (o > 0 && gen > 0) ? +(o / (gen / 1000)).toFixed(2) : 0;
+}
 function derived(o) {
     const out = {};
     for (const [k, v] of Object.entries(o)) {
@@ -358,6 +364,7 @@ function derived(o) {
             hit: v.in ? +(v.cached / v.in * 100).toFixed(1) : 0,
             avg_ms: v.requests ? Math.round(v.ms / v.requests) : 0,
             avg_ttft: v.requests ? Math.round(v.ttft / v.requests) : 0,
+            tps: tpsOf(v.out, v.ms, v.ttft),
         };
     }
     return out;
@@ -453,7 +460,7 @@ function rangeAgg(since, until, tzMin) {
     const t = totals;
     return {
         since: sinceTs || null, until: untilTs, bucket: b.unit,
-        totals: { ...t, hit: t.in ? +(t.cached / t.in * 100).toFixed(1) : 0, avg_ms: t.requests ? Math.round(t.ms / t.requests) : 0, avg_ttft: t.requests ? Math.round(t.ttft / t.requests) : 0 },
+        totals: { ...t, hit: t.in ? +(t.cached / t.in * 100).toFixed(1) : 0, avg_ms: t.requests ? Math.round(t.ms / t.requests) : 0, avg_ttft: t.requests ? Math.round(t.ttft / t.requests) : 0, tps: tpsOf(t.out, t.ms, t.ttft) },
         errors, matched, scanned: matched, segs, truncated: false, series: list,
         by_model: derived(byModel), by_provider: derived(byProvider), by_key: derived(byKey),
     };
