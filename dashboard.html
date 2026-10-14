@@ -717,6 +717,8 @@ $('reload').onclick = () => { refreshStats(); loadConfig(true).then(() => {
 let RANGE = localStorage.getItem('gw_range') || 'all';
 const DAY = 86400e3;
 const RANGE_NAME = { '1h': '最近 1 小时', '5h': '最近 5 小时', '24h': '最近 24 小时', today: '今天', yesterday: '昨天', week: '本周', month: '本月', lastmonth: '上月', all: '全部', custom: '指定时间' };
+// 分桶口径：短区间按小时（今天/昨天要的是 24 根），按周及更长按日期
+const RANGE_UNIT = { '1h': 'hour', '5h': 'hour', '24h': 'hour', today: 'hour', yesterday: 'hour', week: 'day', month: 'day', lastmonth: 'day', all: 'day' };
 function rngCustomWindow() {
   const f = $('rng_from').value, t = $('rng_to').value;
   return { since: f ? new Date(f).getTime() : null, until: t ? new Date(t).getTime() : null };
@@ -750,6 +752,7 @@ function rangeQuery() {
   const p = ['tz=' + (-new Date().getTimezoneOffset())];
   if (w.since != null) p.push('since=' + w.since);
   if (w.until != null) p.push('until=' + w.until);
+  if (RANGE_UNIT[RANGE]) p.push('unit=' + RANGE_UNIT[RANGE]);      // 指定按小时/按日期分桶
   return p.join('&');
 }
 function rangeInfoText(d) {
@@ -820,7 +823,7 @@ async function refreshStats() {
     ? new Date(ts).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
     : new Date(ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false });
   $('chart_title').textContent = (isDay ? '每日' : '每小时') + '输入 tokens';
-  $('chart_sub').textContent = `${RANGE_NAME[RANGE] || ''} · ${ser.length} 桶 · 按本地时间`.replace(/^ · /, '');
+  $('chart_sub').textContent = `${RANGE_NAME[RANGE] || ''} · 按${isDay ? '日' : '小时'} ${ser.length} 桶 · 按本地时间`.replace(/^ · /, '');
   $('range_info').innerHTML = rangeInfoText(d);
   $('bar').style.gap = ser.length > 90 ? '1px' : '2px';
   $('bar').innerHTML = ser.map(x =>

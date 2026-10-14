@@ -373,16 +373,22 @@ function derived(o) {
 // 前端带浏览器时区偏移 tz（分钟）；缺省用服务端本地偏移
 const TZ_DEFAULT_MIN = -new Date().getTimezoneOffset();
 const SERIES_MAX = 400;
-// 跨度 ≤7 天用小时桶；更长用天桶，并把天桶按整数天步长合并，桶数不超过约 120
-function pickBucket(spanMs) {
-    if (spanMs <= 7 * 86400e3) return { unit: 'hour', step: 3600e3 };
+// 分桶：优先用前端给的口径提示（unit='hour'|'day'）；没给就按跨度自动 —— ≤2 天用小时桶，更长用天桶
+// 天桶按整数天步长合并，桶数不超过约 120
+function pickBucket(spanMs, unitHint) {
     const day = 86400e3;
-    return { unit: 'day', step: Math.max(1, Math.ceil(Math.ceil(spanMs / day) / 120)) * day };
+    const hourBucket = { unit: 'hour', step: 3600e3 };
+    const dayBucket = () => ({ unit: 'day', step: Math.max(1, Math.ceil(Math.ceil(spanMs / day) / 120)) * day });
+    if (unitHint === 'hour' && spanMs <= 7 * day) return hourBucket;   // 跨度太大时忽略 hour 提示，免得堆出上千根柱子
+    if (unitHint === 'day') return dayBucket();
+    return spanMs <= 2 * day ? hourBucket : dayBucket();
 }
 const bucketStart = (ts, step, tzMs) => Math.floor((ts + tzMs) / step) * step - tzMs;
 const emptyTotals = () => ({ requests: 0, in: 0, out: 0, cached: 0, reasoning: 0, ms: 0, ttft: 0, bytes_in: 0, bytes_out: 0, bytes_res: 0 });
 function blankSeries(step, tzMs, fromTs, toTs, max = SERIES_MAX) {   // 补齐空桶，让柱子连续（并封顶桶数）
-    const out = [], last = bucketStart(toTs, step, tzMs);
+    // toTs 是开区间端点（SQL 用 ts < until），减 1ms 免得末端多出一根必然为空的桶
+    // —— 否则「昨天」会画出 25 根（末根落在今天 00:00 且恒为 0）
+    const out = [], last = bucketStart(Math.max(fromTs, toTs - 1), step, tzMs);
     let first = bucketStart(fromTs, step, tzMs);
     if ((last - first) / step + 1 > max) first = last - (max - 1) * step;
     for (let t = first; t <= last; t += step) out.push({ ts: t, requests: 0, in: 0, out: 0, cached: 0, reasoning: 0 });
@@ -428,11 +434,14 @@ function segments(s, e) {                   // 整小时段走汇总表，两端
     if (lastHour < e) segs.push({ raw: true, from: lastHour, to: e });
     return segs;
 }
-function rangeAgg(since, until, tzMin) {
+function rangeAgg(since, until, tzMin, unitHint) {
     const tzMs = (Number.isFinite(tzMin) ? tzMin : TZ_DEFAULT_MIN) * 60000;
     const sinceTs = Number.isFinite(since) && since > 0 ? since : 0;
     const untilTs = Number.isFinite(until) && until > 0 ? until : Date.now();
-    const b = pickBucket(Math.max(untilTs - (sinceTs || untilTs - HOUR), HOUR));
+    // 不限起点时（「全部」）跨度必须用库里最早一条来算：以前写成 sinceTs || untilTs - HOUR，
+    // 于是「全部」的跨度被当成 1 小时 → 误选小时桶
+    const firstTs = sinceTs || (DB.prepare('SELECT MIN(ts) m FROM requests').get().m || untilTs - HOUR);
+    const b = pickBucket(Math.max(untilTs - firstTs, HOUR), unitHint);
     const totals = emptyTotals(), byModel = {}, byProvider = {}, byKey = {}, series = new Map();
     let errors = 0, matched = 0, segs = 0;
     for (const seg of segments(sinceTs, untilTs)) {
@@ -453,7 +462,6 @@ function rangeAgg(since, until, tzMin) {
             series.set(bk, cur);
         }
     }
-    const firstTs = sinceTs || (DB.prepare('SELECT MIN(ts) m FROM requests').get().m || untilTs - HOUR);
     const list = matched
         ? mergeIntoSeries(blankSeries(b.step, tzMs, firstTs, Math.min(untilTs, Date.now())), series, b.step)
         : blankSeries(b.step, tzMs, sinceTs || untilTs - 86400e3, untilTs);
@@ -480,7 +488,7 @@ function storageInfo() {
 function statsSnapshot(opts = {}) {
     const tzMin = Number.isFinite(opts.tz) ? opts.tz : TZ_DEFAULT_MIN;
     const ranged = (opts.since != null && Number.isFinite(opts.since)) || (opts.until != null && Number.isFinite(opts.until));
-    const r = rangeAgg(opts.since, opts.until, tzMin);
+    const r = rangeAgg(opts.since, opts.until, tzMin, opts.unit);
     return {
         now: Date.now(), uptime_s: Math.round((Date.now() - STARTED) / 1000),
         total: r.matched, errors: r.errors, totals: r.totals,
@@ -2051,13 +2059,18 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/stats') {
         if (!dashOk && !authenticate(req)) return sendJson(res, 401, { error: { message: 'Invalid API key', type: 'invalid_request_error', code: 'invalid_api_key' } });
         // 概览页时间口径：?since=&until=（epoch ms，可只给一个）+ ?tz=（浏览器时区偏移分钟）
+        // ?unit=hour|day 指定分桶口径（前端按区间给：今天/昨天/24h → hour，本周/本月/上月/全部 → day）
         const numParam = (k) => {
             const v = url.searchParams.get(k);
             if (v === null || v === '') return null;
             const n = Number(v);
             return Number.isFinite(n) ? n : null;
         };
-        return sendJson(res, 200, statsSnapshot({ since: numParam('since'), until: numParam('until'), tz: numParam('tz') }));
+        const unitParam = () => {
+            const v = url.searchParams.get('unit');
+            return v === 'hour' || v === 'day' ? v : undefined;
+        };
+        return sendJson(res, 200, statsSnapshot({ since: numParam('since'), until: numParam('until'), tz: numParam('tz'), unit: unitParam() }));
     }
 
     // ---------------- 配置读写（面板密码通过 或 虚拟 key） ----------------
