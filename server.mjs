@@ -1601,6 +1601,17 @@ async function fetchProviderModels(b) {
 }
 
 // ---------------- 配置视图与变更（面板用） ----------------
+// 「测试供应商」标记：config 里显式写了 test 就听它的；没写则按 base_url 是否指向本机推断
+// （与看板「参与统计」的默认口径一致：本机上游只用于 mock / 测试）
+function isLocalBaseUrl(url) {
+    const h = String(url || '').replace(/^https?:\/\//i, '').split('/')[0].replace(/:\d+$/, '');
+    return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '[::1]';
+}
+function providerIsTest(p) {
+    if (p.test === true) return true;
+    if (p.test === false) return false;
+    return isLocalBaseUrl(p.base_url);
+}
 function configView() {
     const providers = Object.entries(CFG.providers || {}).map(([name, p]) => {
         const route = (CFG.routes || []).find((r) => r.provider === name && r.strip);
@@ -1614,6 +1625,8 @@ function configView() {
             extra_headers: Object.keys(p.extra_headers || {}),
             prefix: route ? route.strip.replace(/\/$/, '') : '',
             models: (CFG.models || []).filter((m) => route && m.startsWith(route.strip)).length,
+            test: providerIsTest(p),                       // 是否测试供应商（显式标记优先，否则按 base_url 推断）
+            test_explicit: p.test !== undefined,           // 是否已显式写进 config.json
         };
     });
     const MT = {};                                            // 每个模型的累计量（模型列表页显示用）
@@ -1628,6 +1641,7 @@ function configView() {
             upstream: rt ? rt.upstream_model : null,
             format: rt ? resolveFormat(rt) : null,
             auto: rt ? !!FORMAT_OVERRIDES[rt.provider + '|' + rt.upstream_model] : false,
+            configured: rt ? !!(CFG.model_formats || {})[rt.provider + '|' + rt.upstream_model] : false,
             requests: st.requests || 0, in: st.in || 0, out: st.out || 0, cached: st.cached || 0,
         };
     });
@@ -1657,6 +1671,7 @@ function applyConfigChange(p, b) {
             ...(b.user_agent ? { user_agent: String(b.user_agent) } : {}),
             ...(b.extra_headers && typeof b.extra_headers === 'object' ? { extra_headers: b.extra_headers } : {}),
             ...(b.reasoning_echo ? { reasoning_echo: true } : {}),
+            ...(b.test !== undefined ? { test: !!b.test } : {}),
         };
         if (b.api_key) setEnvVar(envName, String(b.api_key).trim());
         const prefix = String(b.prefix || name).trim().replace(/\/+$/, '');
@@ -1708,12 +1723,16 @@ function applyConfigChange(p, b) {
             if (b.reasoning_echo) { if (!prov.reasoning_echo) { prov.reasoning_echo = true; changed.push('reasoning_echo(开)'); } }
             else if (prov.reasoning_echo) { delete prov.reasoning_echo; changed.push('reasoning_echo(关)'); }
         }
+        if (b.test !== undefined) {
+            const want = !!b.test;
+            if (prov.test !== want) { prov.test = want; changed.push(want ? 'test(标记为测试)' : 'test(标记为正式)'); }
+        }
         if (b.api_key) { setEnvVar(prov.api_key_env, String(b.api_key).trim()); changed.push('key'); }
         saveConfig(cfg); reloadConfig();
         log('CONFIG update provider', name, changed.join(',') || '(无变化)');
         return { provider: name, updated: true, changed };
     }
-    if (p === '/api/config/model') {
+    if (p === '/api/config/model') {            // 加模型 / 覆盖已有模型：幂等 upsert，已有就按新配置替换
         const id = String(b.id || '').trim();
         const prefix = String(b.prefix || '').trim().replace(/\/+$/, '');
         if (!id) throw new Error('模型 ID 不能为空');
@@ -1722,13 +1741,23 @@ function applyConfigChange(p, b) {
         if (!rt) throw new Error(`没有 prefix 为 ${prefix} 的路由，请先添加供应商`);
         const full = prefix + '/' + id;
         cfg.models = cfg.models || [];
-        if (!cfg.models.includes(full)) cfg.models.push(full);
-        if (b.format && ['chat', 'responses', 'messages'].includes(b.format)) {
-            cfg.model_formats = cfg.model_formats || {};
-            cfg.model_formats[rt.provider + '|' + id] = b.format;
-        }
+        const existed = cfg.models.includes(full);
+        if (!existed) cfg.models.push(full);
+        const fmtKey = rt.provider + '|' + id;
+        const want = ['chat', 'responses', 'messages'].includes(b.format) ? b.format : '';
+        cfg.model_formats = cfg.model_formats || {};
+        const prev = cfg.model_formats[fmtKey] || '';
+        if (want) cfg.model_formats[fmtKey] = want; else delete cfg.model_formats[fmtKey];
+        // 显式配置必须压过「首请求探测」的结果（resolveFormat 里探测优先级更高），否则改不动已有模型
+        const hadProbe = !!FORMAT_OVERRIDES[fmtKey];
+        if (hadProbe) { delete FORMAT_OVERRIDES[fmtKey]; saveOverrides(); }
         saveConfig(cfg); reloadConfig();
-        return { added: full, provider: rt.provider };
+        log('CONFIG model upsert', full, existed ? `覆盖（协议 ${prev || 'auto'} → ${want || 'auto'}）` : '新增');
+        return {
+            model: full, provider: rt.provider, existed,
+            added: existed ? 0 : 1, updated: existed ? 1 : 0,
+            format: want || 'auto', prev_format: prev || 'auto', cleared_probe: hadProbe,
+        };
     }
     if (p === '/api/config/models/bulk') {
         const prefix = String(b.prefix || '').trim().replace(/\/+$/, '');
@@ -1738,17 +1767,20 @@ function applyConfigChange(p, b) {
         const rt = (cfg.routes || []).find((r) => r.model_regex === prefixRe(prefix));
         if (!rt) throw new Error(`没有 prefix 为 ${prefix} 的路由，请先添加供应商`);
         cfg.models = cfg.models || [];
-        let added = 0;
+        const want = ['chat', 'responses', 'messages'].includes(b.format) ? b.format : '';
+        let added = 0, updated = 0, clearedProbe = 0;
         for (const id of ids) {
             const full = prefix + '/' + id;
-            if (!cfg.models.includes(full)) { cfg.models.push(full); added++; }
-            if (b.format && ['chat', 'responses', 'messages'].includes(b.format)) {
-                cfg.model_formats = cfg.model_formats || {};
-                cfg.model_formats[rt.provider + '|' + id] = b.format;
-            }
+            if (!cfg.models.includes(full)) { cfg.models.push(full); added++; } else updated++;
+            const fmtKey = rt.provider + '|' + id;
+            cfg.model_formats = cfg.model_formats || {};
+            if (want) cfg.model_formats[fmtKey] = want; else delete cfg.model_formats[fmtKey];
+            if (FORMAT_OVERRIDES[fmtKey]) { delete FORMAT_OVERRIDES[fmtKey]; clearedProbe++; }
         }
+        if (clearedProbe) saveOverrides();
         saveConfig(cfg); reloadConfig();
-        return { added, skipped: ids.length - added, total: cfg.models.length, prefix };
+        log('CONFIG models bulk', prefix, `新增 ${added} / 覆盖 ${updated} / 清探测 ${clearedProbe}`);
+        return { added, updated, skipped: updated, cleared_probe: clearedProbe, total: cfg.models.length, prefix };
     }
     if (p === '/api/config/provider/delete') {
         const name = String(b.name || '').trim();
@@ -2104,6 +2136,7 @@ const server = http.createServer(async (req, res) => {
                     has_key: !!(process.env[p.api_key_env] || '').length,
                     user_agent: p.user_agent || '',
                     reasoning_echo: !!p.reasoning_echo,
+                    test: providerIsTest(p),
                     extra_headers: p.extra_headers || {},
                     models: (CFG.models || []).filter((m) => rt && m.startsWith(rt.strip)).length,
                 });

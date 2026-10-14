@@ -103,6 +103,16 @@
   .hint{color:var(--dim2);font-size:calc(var(--fs)*0.84)}
   .msg{padding:8px 0;color:var(--dim2)}
   .pill{border:1px solid var(--line);padding:1px 7px;font-size:calc(var(--fs)*0.78);color:var(--dim2)}
+  .pill.t,.pill.f{cursor:pointer}
+  .pill.t{border-color:var(--amber);color:var(--amber)}
+  .pill.f{color:var(--dim2)}
+  .pvgrp{margin-bottom:8px}
+  .pvhead{display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;padding:6px 9px;
+    border:1px solid var(--line);background:var(--btn3);color:var(--amber);font-size:calc(var(--fs)*0.9)}
+  .pvhead:hover{border-color:var(--amber)}
+  .pvhead .line{flex:1;height:1px;background:var(--line2)}
+  .pvhead .caret{width:1em;text-align:center}
+  .pvbody{padding-top:2px}
   /* 「入/出」格：上行 token，下行协议（小一号）。高度锁死＝原单行高（td 字号 0.9×--fs、行高 1.55），
      所以两行也不会撑高行——实测行高与单行版一致（31.92px）。 */
   .tcell{display:flex;flex-direction:column;justify-content:center;height:calc(var(--fs)*0.9*1.55);
@@ -381,8 +391,17 @@
   <!-- ================= 增加供应商 ================= -->
   <section id="tab-providers" class="hidden">
     <div class="box" style="margin-bottom:10px">
-      <div class="h">已有供应商<span class="line"></span></div>
-      <div class="b" style="padding:0 6px 6px"><div class="tblwrap"><table id="tbl_providers"></table></div></div>
+      <div class="h">已有供应商<span class="line"></span><span class="dim" id="pv_sum"></span></div>
+      <div class="b" style="padding:0 6px 6px">
+        <div class="pvgrp">
+          <div class="pvhead" data-pvgrp="real"><span class="caret">▾</span>正式供应商<span class="dim" id="pv_n_real"></span><span class="line"></span></div>
+          <div class="pvbody" id="pv_body_real"><div class="tblwrap"><table id="tbl_providers"></table></div></div>
+        </div>
+        <div class="pvgrp">
+          <div class="pvhead" data-pvgrp="test"><span class="caret">▸</span>测试供应商<span class="dim" id="pv_n_test"></span><span class="line"></span><span class="dim">本机 mock / 测试上游 · 默认折叠</span></div>
+          <div class="pvbody hidden" id="pv_body_test"><div class="tblwrap"><table id="tbl_providers_test"></table></div></div>
+        </div>
+      </div>
     </div>
 
     <div class="grid2">
@@ -405,6 +424,8 @@
           <div class="field"><label>额外请求头（JSON，可选）</label><input id="p_hdr" placeholder='{"x-upstream-session":"__SESSION__"}'></div>
           <div class="field"><label>推理链回灌（chat↔responses 桥接时把 reasoning 项插回，保住思维链）</label>
             <label style="display:flex;gap:8px;align-items:center;color:var(--text)"><input type="checkbox" id="p_echo" style="width:auto"> 开启 reasoning_echo</label></div>
+          <div class="field"><label>测试供应商（列表里归到「测试供应商」分组，默认折叠）</label>
+            <label style="display:flex;gap:8px;align-items:center;color:var(--text)"><input type="checkbox" id="p_test" style="width:auto"> 标记为测试供应商</label></div>
           <button class="act" id="p_submit">保存供应商</button>
           <button class="act" id="p_cancel" style="display:none;margin-left:8px">取消编辑</button>
           <span class="hint" style="margin-left:12px">保存后立即热加载，不用重启</span>
@@ -414,9 +435,9 @@
       <div class="box">
         <div class="h">给供应商加模型<span class="line"></span></div>
         <div class="b">
-          <div class="field"><label>前缀（已有供应商的前缀）</label>
+          <div class="field"><label>供应商（模型加到哪一家）</label>
             <div style="display:flex;gap:8px">
-              <input id="mm_prefix" placeholder="myapi / otherapi">
+              <select id="mm_provider" style="flex:1"></select>
               <button class="act" id="mm_fetch" style="white-space:nowrap">获取该供应商全部模型</button>
             </div></div>
           <div id="mm_status" class="hint"></div>
@@ -449,8 +470,9 @@
               <option value="responses">responses（/responses）</option>
               <option value="messages">messages（Anthropic）</option>
             </select></div>
-          <button class="act" id="mm_submit">添加模型</button>
-          <div class="hint" style="margin-top:12px">协议留空＝自动探测：首次请求按 chat→responses→messages 依次试，成功即记住。</div>
+          <button class="act" id="mm_submit">添加 / 覆盖模型</button>
+          <div class="hint" style="margin-top:12px">协议留空＝自动探测：首次请求按 chat→responses→messages 依次试，成功即记住。<br>
+            模型已经在列表里也没关系——会用这里的配置覆盖它（协议留空＝清掉原有指定与探测结果，回到自动）。</div>
         </div>
       </div>
     </div>
@@ -974,7 +996,9 @@ async function loadConfig(force) {
 const FMT_LABEL = { chat: 'chat', responses: 'responses', messages: 'messages' };
 function fmtCell(m) {
   const cls = m.format === 'messages' ? 'violet' : m.format === 'responses' ? 'cyan' : 'amber';
-  return `<span class="${cls}">${FMT_LABEL[m.format] || '-'}</span>${m.auto ? ' <span class="pill">自动</span>' : ''}`;
+  return `<span class="${cls}">${FMT_LABEL[m.format] || '-'}</span>` +
+    (m.configured ? ' <span class="pill" title="config.json 里显式指定了协议">指定</span>'
+      : m.auto ? ' <span class="pill" title="首次请求探测得到">自动</span>' : '');
 }
 
 function renderModels() {
@@ -1000,15 +1024,55 @@ function renderModels() {
 $('m_search').oninput = renderModels;
 $('m_filter').onchange = renderModels;
 
+/* 供应商列表：正式 / 测试 两组，各自可折叠（测试组默认折叠，状态存 localStorage） */
+const PV_HEAD = ['供应商', 'Base URL', '前缀', 'key', '模型数', '参与统计', '操作'];
+const PV_COLLAPSE_KEY = 'gw_pv_collapsed';
+let PV_COLLAPSED = { real: false, test: true };
+try { PV_COLLAPSED = Object.assign(PV_COLLAPSED, JSON.parse(localStorage.getItem(PV_COLLAPSE_KEY) || '{}') || {}); } catch { }
+function pvRow(p) {
+  const inS = providerInStats(p.name, p.base_url);
+  const tip = p.test_explicit ? 'config.json 里已显式标记' : '未显式标记，按 base_url 是否指向本机推断';
+  return [
+    `${esc(p.name)}` +
+    `<span class="pill ${p.test ? 't' : 'f'}" data-toggletest="${esc(p.name)}" title="点击切换：${p.test ? '当前＝测试供应商' : '当前＝正式供应商'}（${tip}）">${p.test ? '测试' : '正式'}</span>` +
+    (p.reasoning_echo ? ' <span class="pill" title="reasoning_echo：保思维链">回灌</span>' : ''),
+    `<span class="dim">${esc(p.base_url)}</span>`, esc(p.prefix || '-'),
+    p.has_key ? '<span class="green">已设置</span>' : '<span class="red">未设置</span>',
+    p.models,
+    `<label title="不参与统计：该供应商的流量不计入 概览 / 按模型 / 按上游（「最近请求」始终全量显示）。&#10;状态只存在本浏览器，不改配置、不改数据库。&#10;默认：base_url 指向本机（mock/测试上游）的不参与统计。" style="display:flex;gap:6px;align-items:center;justify-content:center;cursor:help"><input type="checkbox" data-pstat="${esc(p.name)}" style="width:auto"${inS ? ' checked' : ''}><span class="dim" style="font-size:calc(var(--fs)*0.8)">${inS ? '参与' : '不参与'}</span></label>`,
+    `<button class="act" data-editp="${esc(p.name)}">编辑</button> ` +
+    `<button class="act danger" data-delp="${esc(p.name)}">删除</button>`];
+}
 function renderProviders() {
   if (!CONF) return;
-  table($('tbl_providers'), ['供应商', 'Base URL', '前缀', 'key', '模型数', '参与统计', '操作'],
-    CONF.providers.map(p => { const inS = providerInStats(p.name, p.base_url); return [`${esc(p.name)}${p.reasoning_echo ? ' <span class="pill" title="reasoning_echo：保思维链">回灌</span>' : ''}`, `<span class="dim">${esc(p.base_url)}</span>`, esc(p.prefix || '-'),
-      p.has_key ? '<span class="green">已设置</span>' : '<span class="red">未设置</span>',
-      p.models,
-      `<label title="不参与统计：该供应商的流量不计入 概览 / 按模型 / 按上游（「最近请求」始终全量显示）。&#10;状态只存在本浏览器，不改配置、不改数据库。&#10;默认：base_url 指向本机（mock/测试上游）的不参与统计。" style="display:flex;gap:6px;align-items:center;justify-content:center;cursor:help"><input type="checkbox" data-pstat="${esc(p.name)}" style="width:auto"${inS ? ' checked' : ''}><span class="dim" style="font-size:calc(var(--fs)*0.8)">${inS ? '参与' : '不参与'}</span></label>`,
-      `<button class="act" data-editp="${esc(p.name)}">编辑</button> ` +
-      `<button class="act danger" data-delp="${esc(p.name)}">删除</button>`]; }), '还没有供应商', null, [1]);
+  const all = CONF.providers || [];
+  const real = all.filter(p => !p.test), test = all.filter(p => p.test);
+  $('pv_sum').textContent = `${all.length} 个（正式 ${real.length} · 测试 ${test.length}）`;
+  $('pv_n_real').textContent = `（${real.length}）`;
+  $('pv_n_test').textContent = `（${test.length}）`;
+  for (const k of ['real', 'test']) {
+    $('pv_body_' + k).classList.toggle('hidden', !!PV_COLLAPSED[k]);
+    $('pv_body_' + k).parentElement.querySelector('.caret').textContent = PV_COLLAPSED[k] ? '▸' : '▾';
+  }
+  table($('tbl_providers'), PV_HEAD, real.map(pvRow), '还没有供应商', null, [1]);
+  table($('tbl_providers_test'), PV_HEAD, test.map(pvRow), '没有测试供应商', null, [1]);
+  document.querySelectorAll('[data-pvgrp]').forEach(h => h.onclick = () => {
+    const k = h.dataset.pvgrp;
+    PV_COLLAPSED[k] = !PV_COLLAPSED[k];
+    try { localStorage.setItem(PV_COLLAPSE_KEY, JSON.stringify(PV_COLLAPSED)); } catch { }
+    renderProviders();
+  });
+  document.querySelectorAll('[data-toggletest]').forEach(b => b.onclick = async (ev) => {
+    ev.stopPropagation();
+    const name = b.dataset.toggletest;
+    const p = all.find(x => x.name === name) || {};
+    try {
+      const r = await api('/api/config/provider/update', { name, test: !p.test });
+      CONF = r.config;
+      toast(`${name} → ${p.test ? '正式供应商' : '测试供应商'}`);
+      renderProviders();
+    } catch (e) { toast('失败：' + e.message, 1); }
+  });
   document.querySelectorAll('[data-pstat]').forEach(c => c.onchange = () => {
     setProviderInStats(c.dataset.pstat, c.checked);
     toast(`供应商 ${c.dataset.pstat}：${c.checked ? '参与统计' : '不参与统计'}（「最近请求」不受影响）`);
@@ -1026,6 +1090,7 @@ function renderProviders() {
       renderProviders();
     } catch (e) { toast('失败：' + e.message, 1); }
   });
+  renderProviderSelect();
 }
 /* ---- 编辑已有供应商 ---- */
 let EDIT_NAME = null, UA_ORIG = '', HDR_ORIG = '';
@@ -1033,6 +1098,7 @@ function resetProviderForm() {
   EDIT_NAME = null; UA_ORIG = ''; HDR_ORIG = '';
   ['p_name', 'p_prefix', 'p_url', 'p_env', 'p_ua', 'p_hdr', 'p_key'].forEach(id => { $(id).value = ''; $(id).disabled = false; });
   $('p_echo').checked = false;
+  $('p_test').checked = false;
   $('p_key').placeholder = 'sk-...';
   $('p_title').textContent = '新增 / 覆盖供应商';
   $('p_submit').textContent = '保存供应商';
@@ -1053,6 +1119,7 @@ async function startEditProvider(name) {
     $('p_ua').value = UA_ORIG;
     $('p_hdr').value = HDR_ORIG;
     $('p_echo').checked = !!d.reasoning_echo;
+    $('p_test').checked = !!d.test;
     $('p_title').textContent = '编辑供应商：' + d.name;
     $('p_submit').textContent = '保存修改';
     $('p_cancel').style.display = '';
@@ -1074,7 +1141,7 @@ $('p_submit').onclick = async () => {
       const r = await api('/api/config/provider/update', {
         name: EDIT_NAME, base_url: $('p_url').value.trim(),
         api_key: $('p_key').value.trim(), api_key_env: $('p_env').value.trim(),
-        user_agent: ua, extra_headers: extra || {}, reasoning_echo: $('p_echo').checked,
+        user_agent: ua, extra_headers: extra || {}, reasoning_echo: $('p_echo').checked, test: $('p_test').checked,
       });
       CONF = r.config;
       toast(`已更新 ${r.provider}：${(r.changed || []).join('、') || '无变化'}`);
@@ -1085,6 +1152,7 @@ $('p_submit').onclick = async () => {
       name: $('p_name').value.trim(), prefix: $('p_prefix').value.trim(), base_url: $('p_url').value.trim(),
       api_key: $('p_key').value.trim(), api_key_env: $('p_env').value.trim(),
       user_agent: $('p_ua').value.trim(), extra_headers: extra, reasoning_echo: $('p_echo').checked,
+      test: $('p_test').checked,
     });
     CONF = r.config;
     resetProviderForm();
@@ -1094,9 +1162,25 @@ $('p_submit').onclick = async () => {
 };
 /* ---- 拉取上游模型列表 → 勾选批量添加 ---- */
 let FETCHED = [], FETCH_PREFIX = '';
+// 供应商下拉：选项来自 CONF.providers（增删供应商 → 刷新页面/保存后自动重建）
+function renderProviderSelect() {
+  const sel = $('mm_provider'); if (!sel || !CONF) return;
+  const prev = sel.value;
+  const list = CONF.providers || [];
+  sel.innerHTML = list.length
+    ? list.map(p => `<option value="${esc(p.name)}"${p.prefix ? '' : ' disabled'}>${esc(p.name)}${p.prefix ? `（${esc(p.prefix)}/）` : '（无前缀，不能加模型）'}${p.test ? ' · 测试' : ''}</option>`).join('')
+    : '<option value="">（还没有供应商）</option>';
+  const opts = [...sel.options];
+  if (prev && opts.some(o => o.value === prev && !o.disabled)) sel.value = prev;
+  else { const f = opts.find(o => !o.disabled); if (f) sel.value = f.value; }
+}
+function mmPrefix() {
+  const p = ((CONF && CONF.providers) || []).find(x => x.name === $('mm_provider').value);
+  return p && p.prefix ? p.prefix : '';
+}
 async function doFetch() {
-  const prefix = $('mm_prefix').value.trim().replace(/\/+$/, '');
-  if (!prefix) return toast('先填前缀', 1);
+  const prefix = mmPrefix();
+  if (!prefix) return toast('先选一个有前缀的供应商', 1);
   FETCH_PREFIX = prefix;
   $('mm_status').innerHTML = '<span class="amber">正在请求上游 /models …</span>';
   $('mm_panel').classList.add('hidden');
@@ -1127,7 +1211,11 @@ function renderFetched() {
   updSel();
 }
 $('mm_fetch').onclick = doFetch;
-$('mm_prefix').addEventListener('keydown', e => { if (e.key === 'Enter') doFetch(); });
+$('mm_provider').onchange = () => {                       // 换供应商就丢掉上一次的拉取结果
+  FETCHED = []; FETCH_PREFIX = '';
+  $('mm_panel').classList.add('hidden');
+  $('mm_status').textContent = '';
+};
 $('mm_search').oninput = renderFetched;
 $('mm_all').onclick = () => { $('mm_list').querySelectorAll('input[type=checkbox]').forEach(c => c.checked = true); updSel(); };
 $('mm_none').onclick = () => { $('mm_list').querySelectorAll('input[type=checkbox]').forEach(c => c.checked = false); updSel(); };
@@ -1135,18 +1223,28 @@ $('mm_bulkadd').onclick = async () => {
   const ids = selIds();
   if (!ids.length) return toast('没有勾选模型', 1);
   try {
-    const r = await api('/api/config/models/bulk', { prefix: FETCH_PREFIX || $('mm_prefix').value.trim(), ids, format: $('mm_bulkfmt').value });
+    const r = await api('/api/config/models/bulk', { prefix: FETCH_PREFIX || mmPrefix(), ids, format: $('mm_bulkfmt').value });
     CONF = r.config;
-    toast(`已添加 ${r.added} 个${r.skipped ? `（${r.skipped} 个已存在）` : ''}，列表共 ${r.total} 个`);
+    toast(`已添加 ${r.added} 个${r.updated ? `、覆盖 ${r.updated} 个` : ''}，列表共 ${r.total} 个`);
     await doFetch();
     renderProviders();
   } catch (e) { toast('失败：' + e.message, 1); }
 };
 
+const fmtName = (f) => (!f || f === 'auto') ? '自动探测' : f;
 $('mm_submit').onclick = async () => {
+  const id = $('mm_id').value.trim();
+  const prefix = mmPrefix();
+  if (!id) return toast('先填模型 ID', 1);
+  if (!prefix) return toast('先选一个有前缀的供应商', 1);
   try {
-    const r = await api('/api/config/model', { prefix: $('mm_prefix').value.trim(), id: $('mm_id').value.trim(), format: $('mm_fmt').value });
-    CONF = r.config; toast('已添加 ' + r.added); $('mm_id').value = ''; renderProviders();
+    const r = await api('/api/config/model', { prefix, id, format: $('mm_fmt').value });
+    CONF = r.config;
+    toast(r.existed
+      ? `已覆盖 ${r.model}：协议 ${fmtName(r.prev_format)} → ${fmtName(r.format)}`
+      : `已添加 ${r.model}（协议 ${fmtName(r.format)}）`);
+    $('mm_id').value = '';
+    renderProviders();
   } catch (e) { toast('失败：' + e.message, 1); }
 };
 
