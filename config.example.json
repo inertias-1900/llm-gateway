@@ -1,12 +1,18 @@
 {
-  "listen": { "host": "0.0.0.0", "port": 8010 },
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 8010
+  },
   "enabled": true,
   "capture": false,
-
   "keys": [
-    { "name": "client-a", "key": "sk-gw-REPLACE_ME", "session_id": "00000000-0000-0000-0000-000000000001", "protocol_interop": false }
+    {
+      "name": "client-a",
+      "key": "sk-gw-REPLACE_ME",
+      "session_id": "00000000-0000-0000-0000-000000000001",
+      "protocol_interop": false
+    }
   ],
-
   "providers": {
     "upstream-a": {
       "base_url": "https://api.upstream-a.example.com/v1",
@@ -22,7 +28,6 @@
       "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     }
   },
-
   "routes": [
     {
       "model_regex": "^a/",
@@ -38,28 +43,54 @@
       "format": "chat"
     }
   ],
-
-  "models": ["a/some-model", "b/another-model"],
-
+  "models": [
+    "a/some-model",
+    "b/another-model"
+  ],
   "model_formats": {
     "upstream-a|some-model": "responses"
   },
-
   "dashboard_auth": {
     "hosts": []
   },
-
   "prices": {
-    "some-model": { "in": 0.1, "out": 0.5, "cached": 0.01, "cap": null }
+    "some-model": {
+      "in": 0.1,
+      "out": 0.5,
+      "cached": 0.01,
+      "cap": null
+    }
   },
-
   "peak_prices": {
-    "another-model": { "cap": 60, "peak": [0.3, 1.2, 0.006], "off": [0.15, 0.6, 0.003] }
+    "another-model": {
+      "cap": 60,
+      "peak": [
+        0.3,
+        1.2,
+        0.006
+      ],
+      "off": [
+        0.15,
+        0.6,
+        0.003
+      ]
+    }
   },
-
   "quota": {
-    "provider_prefixes": ["a/", "b/"],
-    "balance": { "url": "", "api_key_env": "" },
-    "usage": { "url": "", "api_key_env": "" }
+    "provider_prefixes": [
+      "a/",
+      "b/"
+    ],
+    "base_usd": 60,
+    "cycle_day": 1,
+    "cycle_count": 6,
+    "balance": {
+      "url": "",
+      "api_key_env": ""
+    },
+    "usage": {
+      "url": "",
+      "api_key_env": ""
+    }
   }
 }

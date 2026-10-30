@@ -1,12 +1,9 @@
 #!/usr/bin/env node
 /**
- * 最小化 LLM 网关（零依赖，只用 Node 内置模块）
- *
- * - 对外三条入口：/v1/chat/completions（OpenAI chat）、/v1/responses、/v1/messages
- * - 对内按模型名路由到不同上游：chat 客户端可与任意协议的上游双向转换（chat ↔ responses / messages）；
- *   responses / messages 原生客户端走同协议直通（不做翻译）
- * - 鉴权：虚拟 key（Bearer 或 x-api-key）；可为每个 key 配稳定的上游会话标识头（providers.<name>.extra_headers）
- * - 统计：每条请求落 SQLite（stats/requests.db）；stats/*.jsonl 只滚动留 3 天，供 grep / 取证
+ * 网关核心：对客户端暴露 OpenAI Chat Completions，按模型路由到不同上游/不同协议。
+ * - 上游 formats: "chat" = 原样透传 /chat/completions；"responses" = 翻译成 /v1/responses 再翻回来
+ * - 鉴权：虚拟 key（Bearer 或 x-api-key），每个 key 可绑定一个稳定的上游 session 头
+ * - 统计：每条请求落 stats/requests-YYYY-MM-DD.jsonl（按天分文件），超过 3 天的自动 gzip
  */
 import http from 'node:http';
 import fs from 'node:fs';
@@ -413,6 +410,17 @@ const ROLL_SERIES = `SELECT hour h, SUM(requests) n, SUM(in_tok) i, SUM(out_tok)
   FROM rollup_hour WHERE hour >= ? AND hour < ? GROUP BY hour`;
 const RAW_SERIES = `SELECT (ts/3600000)*3600000 h, COUNT(*) n, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c, SUM(reasoning) rz
   FROM requests WHERE ts >= ? AND ts < ? GROUP BY h`;
+// 按去向分色的序列（?dim=model|provider|key）：每桶再按该维度拆开，供看板堆叠柱状图着色。
+// 只做「已选中的那一维」，避免一次吐三个维度的数据把响应撑大。
+const DIM_EXPR = {
+    model: `COALESCE(NULLIF(model,''), '${MODEL_UNKNOWN}')`,
+    provider: `COALESCE(NULLIF(provider,''), '(未路由)')`,
+    key: `COALESCE(NULLIF(key,''), '(未知)')`,
+};
+const ROLL_SERIES_DIM = (d) => `SELECT hour h, ${DIM_EXPR[d]} k, SUM(requests) n, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c, SUM(reasoning) rz
+  FROM rollup_hour WHERE hour >= ? AND hour < ? GROUP BY h, k`;
+const RAW_SERIES_DIM = (d) => `SELECT (ts/3600000)*3600000 h, ${DIM_EXPR[d]} k, COUNT(*) n, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c, SUM(reasoning) rz
+  FROM requests WHERE ts >= ? AND ts < ? GROUP BY h, k`;
 function sqlAgg(sql, args) {
     return DB.prepare(sql).all(...args).map((x) => ({
         model: x.model, provider: x.provider, key: x.key,
@@ -434,7 +442,7 @@ function segments(s, e) {                   // 整小时段走汇总表，两端
     if (lastHour < e) segs.push({ raw: true, from: lastHour, to: e });
     return segs;
 }
-function rangeAgg(since, until, tzMin, unitHint) {
+function rangeAgg(since, until, tzMin, unitHint, dim) {
     const tzMs = (Number.isFinite(tzMin) ? tzMin : TZ_DEFAULT_MIN) * 60000;
     const sinceTs = Number.isFinite(since) && since > 0 ? since : 0;
     const untilTs = Number.isFinite(until) && until > 0 ? until : Date.now();
@@ -444,8 +452,10 @@ function rangeAgg(since, until, tzMin, unitHint) {
     const b = pickBucket(Math.max(untilTs - firstTs, HOUR), unitHint);
     const totals = emptyTotals(), byModel = {}, byProvider = {}, byKey = {}, series = new Map();
     let errors = 0, matched = 0, segs = 0;
-    for (const seg of segments(sinceTs, untilTs)) {
-        segs++;
+    const segList = segments(sinceTs, untilTs);
+    segs = segList.length;
+    const dimNames = [], dimIdx = new Map(), dimSeries = new Map();   // ?dim= 分色：桶 -> 维度 -> 数值
+    for (const seg of segList) {
         for (const v of sqlAgg(seg.raw ? RAW_SQL : ROLL_SQL, [seg.from, seg.to])) {
             matched += v.requests; errors += v.errors;
             totals.requests += v.requests; totals.in += v.in; totals.out += v.out; totals.cached += v.cached;
@@ -462,14 +472,36 @@ function rangeAgg(since, until, tzMin, unitHint) {
             series.set(bk, cur);
         }
     }
+    if (dim) {
+        for (const seg of segList) {
+            for (const x of DB.prepare(seg.raw ? RAW_SERIES_DIM(dim) : ROLL_SERIES_DIM(dim)).all(seg.from, seg.to)) {
+                const bk = bucketStart(x.h, b.step, tzMs);
+                const name = x.k || '?';
+                let ix = dimIdx.get(name);
+                if (ix === undefined) { ix = dimNames.length; dimIdx.set(name, ix); dimNames.push(name); }
+                let m = dimSeries.get(bk);
+                if (!m) dimSeries.set(bk, m = new Map());
+                const cur = m.get(ix) || { in: 0, out: 0, requests: 0 };
+                cur.in += x.i || 0; cur.out += x.o || 0; cur.requests += x.n || 0;
+                m.set(ix, cur);
+            }
+        }
+    }
     const list = matched
         ? mergeIntoSeries(blankSeries(b.step, tzMs, firstTs, Math.min(untilTs, Date.now())), series, b.step)
         : blankSeries(b.step, tzMs, sinceTs || untilTs - 86400e3, untilTs);
+    if (dim && dimSeries.size) {
+        for (const bucket of list) {
+            const m = dimSeries.get(bucket.ts);
+            if (m && m.size) bucket.seg = [...m.entries()].map(([ix, v]) => [ix, v.in, v.out, v.requests]);
+        }
+    }
     const t = totals;
     return {
         since: sinceTs || null, until: untilTs, bucket: b.unit,
         totals: { ...t, hit: t.in ? +(t.cached / t.in * 100).toFixed(1) : 0, avg_ms: t.requests ? Math.round(t.ms / t.requests) : 0, avg_ttft: t.requests ? Math.round(t.ttft / t.requests) : 0, tps: tpsOf(t.out, t.ms, t.ttft) },
         errors, matched, scanned: matched, segs, truncated: false, series: list,
+        dim: dim || null, dim_names: dimNames,
         by_model: derived(byModel), by_provider: derived(byProvider), by_key: derived(byKey),
     };
 }
@@ -488,12 +520,13 @@ function storageInfo() {
 function statsSnapshot(opts = {}) {
     const tzMin = Number.isFinite(opts.tz) ? opts.tz : TZ_DEFAULT_MIN;
     const ranged = (opts.since != null && Number.isFinite(opts.since)) || (opts.until != null && Number.isFinite(opts.until));
-    const r = rangeAgg(opts.since, opts.until, tzMin, opts.unit);
+    const r = rangeAgg(opts.since, opts.until, tzMin, opts.unit, opts.dim);
     return {
         now: Date.now(), uptime_s: Math.round((Date.now() - STARTED) / 1000),
         total: r.matched, errors: r.errors, totals: r.totals,
         by_model: r.by_model, by_provider: r.by_provider, by_key: r.by_key,
         series: r.series, bucket: r.bucket, tz_min: tzMin,
+        dim: r.dim, dim_names: r.dim_names,
         range: ranged ? { since: r.since, until: r.until, matched: r.matched, segs: r.segs } : null,
         storage: storageInfo(),
         config: {
@@ -553,9 +586,36 @@ function setEnvVar(name, value) {
 function authenticate(req) {
     const h = req.headers['authorization'] || '';
     const bearer = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
-    const key = bearer || (req.headers['x-api-key'] || '').trim();
+    // x-goog-api-key：Google SDK / 原生 Gemini 客户端的标准头
+    const key = bearer || (req.headers['x-api-key'] || '').trim() || (req.headers['x-goog-api-key'] || '').trim();
     const hit = KEYS.get(key);
-    return hit ? { name: hit.name, session_id: hit.session_id, key, protocol: hit.protocol || '', interop: !!hit.protocol_interop } : null;
+    // allow：该 key 的模型白名单（config.keys[].models）。null/空 = 不限制，全部模型可用（默认行为）。
+    return hit ? { name: hit.name, session_id: hit.session_id, key, protocol: hit.protocol || '', interop: !!hit.protocol_interop, allow: Array.isArray(hit.models) && hit.models.length ? hit.models : null } : null;
+}
+// 客户端 key 的模型白名单判定。白名单为空 = 全部放开（默认）。
+// 匹配口径：优先按对外模型名精确比对；其次按「上游实体」（provider + upstream_model）比对，
+// 这样客户端用带前缀名（ocg/gpt-x）或不带前缀的裸名（gpt-x，走兜底路由）都会被认成同一个模型。
+// 对外用 404/403 而不是悄悄成功——白名单只决定「键能用什么」，不改变路由语义。
+const ALLOW_ENTITY = new Map();          // 白名单数组指纹 -> Set(上游实体)
+function allowedEntities(allow) {
+    const sig = allow.join('\u0000');
+    let set = ALLOW_ENTITY.get(sig);
+    if (set) return set;
+    set = new Set();
+    for (const m of allow) {
+        const rt = routeFor(m);
+        if (rt) set.add(rt.provider + '|' + rt.upstream_model);
+    }
+    if (ALLOW_ENTITY.size > 200) ALLOW_ENTITY.clear();      // 白名单常改，别无限涨
+    ALLOW_ENTITY.set(sig, set);
+    return set;
+}
+function modelAllowed(auth, model) {
+    if (!auth || !auth.allow) return true;
+    const m = String(model || '');
+    if (auth.allow.includes(m)) return true;
+    const rt = routeFor(m);
+    return !!rt && allowedEntities(auth.allow).has(rt.provider + '|' + rt.upstream_model);
 }
 function routeFor(model) {
     for (const r of CFG.routes || []) {
@@ -586,6 +646,10 @@ function upstreamHeaders(p, sessionId, accept, format) {
         h['anthropic-version'] = p.anthropic_version || '2023-06-01';
         delete h['Authorization'];
     }
+    if (format === 'gemini') {
+        // 原生 Google 端点：x-goog-api-key 是标准头（实测 Authorization: Bearer 也能过，但两者并存最稳）
+        h['x-goog-api-key'] = process.env[p.api_key_env] || '';
+    }
     return h;
 }
 
@@ -611,17 +675,175 @@ function modelProtocol(id) {
     const learned = !!(FORMAT_OVERRIDES[rt.provider + '|' + rt.upstream_model]);
     return { protocol: resolveFormat(rt), detected: learned };
 }
+// 对外模型可用的推理档位（手工指定 > 探测缓存；都没配＝null＝网关不干预、原样透传）
+function effortsForModel(id) {
+    const rt = routeFor(String(id || ''));
+    return rt ? effortsFor(rt.provider, rt.upstream_model) : null;
+}
 
 // 上游说"协议不对"时允许换协议重试（只对 auto 路由生效）
 const PROTOCOL_HINT = /ModelProtocolUnsupported|does not support this protocol|unsupported protocol|endpoint is unavailable|not supported for this endpoint/i;
 const protocolMismatch = (status, txt) => PROTOCOL_HINT.test(txt) && [400, 404, 405, 422, 500, 501, 503].includes(status);
-const ALL_FORMATS = ['chat', 'responses', 'messages'];
+const ALL_FORMATS = ['chat', 'responses', 'messages', 'gemini'];
 function protocolCandidates(rt) {
     const pref = resolveFormat(rt);
     if (rt.format && rt.format !== 'auto') return [pref];
+    // gemini 排最后：只有前三家全都报「不支持该协议」时才会试到它，普通模型不会多打一格
     return [pref, ...ALL_FORMATS.filter((f) => f !== pref)];
 }
+// ---------------- 推理档位（reasoning effort）能力层 ----------------
+// 阶梯与 Hermes 本体一致（hermes_constants.VALID_REASONING_EFFORTS）；ultra 是 Hermes 内部档位，语义＝max。
+const EFFORT_LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const EFFORT_BUDGET = { minimal: 1024, low: 2048, medium: 8192, high: 16384, xhigh: 32768, max: 65536, ultra: 65536 };
+const effortKeyOf = (provider, model) => String(provider || '') + '|' + String(model || '');
+const normEfforts = (arr) => {                     // 归一化 + 按阶梯排序（clampEffort 依赖这个顺序）
+    const src = (Array.isArray(arr) ? arr : []).map((x) => String(x).trim().toLowerCase());
+    return EFFORT_LADDER.filter((lvl) => src.includes(lvl));
+};
+// 面板输入 → 档位数组：支持数组或 "high,max" 这种串；空串/空数组＝清除；出现非法档位名直接报错
+function parseEffortsInput(v) {
+    const raw = Array.isArray(v) ? v.join(',') : String(v == null ? '' : v).trim();
+    if (!raw) return [];
+    const parts = raw.split(/[,\s/|]+/).filter(Boolean);
+    const norm = normEfforts(parts);
+    const bad = parts.map((x) => x.toLowerCase()).filter((x) => !EFFORT_LADDER.includes(x));
+    if (bad.length) throw new Error(`不认识的推理档位: ${bad.join(', ')}（只能是 ${EFFORT_LADDER.join(' / ')}，留空＝清除）`);
+    return norm;
+}
+
+// 生效档位：手工指定（config.model_efforts）> 探测缓存（config.effort_probes）> null（＝不干预，原样透传）
+function effortsFor(provider, upstreamModel) {
+    const manual = CFG.model_efforts || {};
+    const direct = normEfforts(manual[effortKeyOf(provider, upstreamModel)]);
+    if (direct.length) return direct;
+    const providerWide = normEfforts(manual[effortKeyOf(provider, '*')]);
+    if (providerWide.length) return providerWide;
+    const probe = (CFG.effort_probes || {})[effortKeyOf(provider, upstreamModel)];
+    const probed = normEfforts(probe && probe.levels);
+    if (probed.length) return probed;
+    return null;
+}
+
+// 就近降级（与 Hermes agent/reasoning_effort.py::clamp_effort 同语义）：支持的照发；不支持的降到
+// 「最接近的弱档」，没有更弱的档就落到表里最弱的一档——只降不升，绝不因为降级而变贵。
+function clampEffort(effort, supported) {
+    const want = String(effort || '').trim().toLowerCase();
+    if (!want || !Array.isArray(supported) || !supported.length) return effort;
+    if (supported.includes(want)) return effort;
+    const wi = EFFORT_LADDER.indexOf(want);
+    if (wi < 0) return effort;                     // 自定义档位名：不认，原样透传
+    const below = supported.filter((e) => EFFORT_LADDER.indexOf(e) < wi);
+    return below.length ? below[below.length - 1] : supported[0];
+}
+
+// 把 body 里客户端显式给的档位夹到该 provider|model 支持的档位（没配、没探测过＝完全不干预）
+// 先查 model_effort_overrides 的厂商自有映射（例：medium→high、xhigh→max），再就近降级
+function clampBodyEffort(body, rt) {
+    const sup = effortsFor(rt.provider, rt.upstream_model);
+    if (!sup) return body;
+    const ov = (CFG.model_effort_overrides || {})[effortKeyOf(rt.provider, rt.upstream_model)] || null;
+    const pick = (cur) => {
+        const mapped = ov ? ov[String(cur).toLowerCase()] : null;
+        const c = (mapped && sup.includes(mapped)) ? mapped : clampEffort(cur, sup);
+        return String(c).toLowerCase() === String(cur).toLowerCase() ? null : c;
+    };
+    const out = { ...body };
+    let from = null, to = null, c, mapped = false;
+    const pickMapped = (cur) => {
+        const r = pick(cur);
+        if (r && ov && ov[String(cur).toLowerCase()] === r) mapped = true;
+        return r;
+    };
+    if (out.reasoning_effort != null && (c = pickMapped(out.reasoning_effort))) { from = from || out.reasoning_effort; to = to || c; out.reasoning_effort = c; }
+    if (out.reasoning && typeof out.reasoning === 'object' && out.reasoning.effort != null && (c = pickMapped(out.reasoning.effort))) {
+        from = from || out.reasoning.effort; to = to || c; out.reasoning = { ...out.reasoning, effort: c };
+    }
+    if (out.output_config && typeof out.output_config === 'object' && out.output_config.effort != null && (c = pickMapped(out.output_config.effort))) {
+        from = from || out.output_config.effort; to = to || c; out.output_config = { ...out.output_config, effort: c };
+    }
+    if (from) log(mapped ? 'EFFORT 映射' : 'EFFORT 降级', rt.provider + '|' + rt.upstream_model, `${from} -> ${to}`, `(支持 ${sup.join('/')})`);
+    return out;
+}
+
+// ---------------- 档位探测：对某个对外模型逐档打最小请求，看上游接受哪些档 ----------------
+const EFFORT_PROBE_PROMPT = '算一下 17×23 等于多少，只回数字';
+function probePayloadFor(fmt, model, lvl, thinkingStyle) {
+    if (fmt === 'chat') return { path: '/chat/completions', body: { model, messages: [{ role: 'user', content: EFFORT_PROBE_PROMPT }], max_tokens: 64, reasoning_effort: lvl } };
+    if (fmt === 'responses') return { path: '/responses', body: { model, input: EFFORT_PROBE_PROMPT, max_output_tokens: 64, reasoning: { effort: lvl } } };
+    if (fmt === 'gemini') {                     // 原生 Google：模型在路径里，档位走 generationConfig.thinkingConfig
+        const gl = geminiThinkingLevel(lvl);
+        return {
+            path: `/models/${encodeURIComponent(model)}:generateContent`,
+            body: {
+                contents: [{ role: 'user', parts: [{ text: EFFORT_PROBE_PROMPT }] }],
+                generationConfig: { maxOutputTokens: 200, ...(gl ? { thinkingConfig: { includeThoughts: true, thinkingLevel: gl } } : {}) },
+            },
+        };
+    }
+    if (thinkingStyle === 'adaptive') return { path: '/messages', body: { model, max_tokens: 128, messages: [{ role: 'user', content: EFFORT_PROBE_PROMPT }], thinking: { type: 'adaptive' }, output_config: { effort: lvl } } };
+    return { path: '/messages', body: { model, max_tokens: EFFORT_BUDGET[lvl] + 4096, messages: [{ role: 'user', content: EFFORT_PROBE_PROMPT }], thinking: { type: 'enabled', budget_tokens: EFFORT_BUDGET[lvl] } } };
+}
+function sawReasoningIn(fmt, txt) {                 // 该档位是否真的产出了推理内容（null＝判不了）
+    try {
+        if (fmt === 'chat') { const j = JSON.parse(txt); return String((j.choices || [])[0]?.message?.reasoning_content || '').length > 0; }
+        if (fmt === 'responses') { const j = JSON.parse(txt); return (j.output || []).some((it) => it.type === 'reasoning' && ((it.content || []).length || (it.summary || []).length)); }
+        if (fmt === 'gemini') { const j = JSON.parse(txt); return ((j.candidates || [])[0]?.content?.parts || []).some((p) => p.thought); }
+        const j = JSON.parse(txt); return (j.content || []).some((b) => b.type === 'thinking');
+    } catch { return null; }
+}
+async function probeModelEfforts(id, opts = {}) {
+    const rt = routeFor(String(id || ''));
+    if (!rt) throw new Error('模型未路由: ' + id);
+    const p = rt.providerCfg || {};
+    const fmt = resolveFormat(rt);
+    const style = p.thinking_style || 'none';
+    const levels = normEfforts(opts.levels && opts.levels.length ? opts.levels : EFFORT_LADDER);
+    const base = String(p.base_url || '').replace(/\/+$/, '');
+    const out = {
+        id: String(id), provider: rt.provider, upstream_model: rt.upstream_model,
+        format: fmt, thinking_style: style, levels: [], rejected: {}, saw_reasoning: {},
+        at: new Date().toISOString(), note: '',
+    };
+    if (fmt === 'messages' && style === 'none') {
+        out.note = '该供应商 thinking_style=none（messages 端点不接收档位参数），无法探测';
+        return out;
+    }
+    const sessionId = ((CFG.keys || [])[0] || {}).session_id;
+    for (const lvl of levels) {
+        const { path: up, body } = probePayloadFor(fmt, rt.upstream_model, lvl, style);
+        const headers = upstreamHeaders(p, sessionId, 'application/json', fmt);
+        let status = 0, txt = '';
+        try {
+            const r = await fetch(base + up, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(opts.timeout || 30000) });
+            status = r.status; txt = await r.text();
+        } catch (e) { status = 0; txt = 'fetch failed: ' + e.message; }
+        if (status === 200) {
+            out.levels.push(lvl);
+            const saw = sawReasoningIn(fmt, txt);
+            if (saw !== null) out.saw_reasoning[lvl] = saw;
+        } else {
+            out.rejected[lvl] = status + ' ' + txt.slice(0, 200).replace(/\s+/g, ' ');
+        }
+    }
+    if (out.levels.length === levels.length && !Object.values(out.saw_reasoning).some(Boolean)) {
+        out.note = '所有档位都被接受，但没观察到推理输出 —— 可能不是推理模型，档位表对它无实际作用';
+    } else if (!out.levels.length) {
+        out.note = '所有档位都被上游拒绝，先确认协议（format）是否选对';
+    }
+    if (opts.persist !== false) {
+        const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+        cfg.effort_probes = cfg.effort_probes || {};
+        cfg.effort_probes[effortKeyOf(rt.provider, rt.upstream_model)] = {
+            levels: out.levels, rejected: out.rejected, saw_reasoning: out.saw_reasoning,
+            format: fmt, thinking_style: style, at: out.at, note: out.note,
+        };
+        saveConfig(cfg); reloadConfig();
+    }
+    log('PROBE efforts', effortKeyOf(rt.provider, rt.upstream_model), `${out.levels.length}/${levels.length} 档接受`, out.note ? '（' + out.note + '）' : '');
+    return out;
+}
 function buildUpstream(rt, format, body, sessionId, ctx) {
+    body = clampBodyEffort(body, rt);              // 客户端给了不支持的档位 → 就近降级（没配置过＝不动）
     const headers = upstreamHeaders(rt.providerCfg, sessionId, body.stream ? 'text/event-stream' : 'application/json', format);
     if (format === 'responses') {
         let reasonInj = 0;
@@ -632,8 +854,13 @@ function buildUpstream(rt, format, body, sessionId, ctx) {
     if (format === 'messages') {
         return { url: rt.providerCfg.base_url + '/messages', payload: chatToMessages(body, rt.upstream_model, rt.providerCfg), headers };
     }
+    if (format === 'gemini') {
+        // 原生 Google 端点：模型名在路径里，不在 body 里
+        const path = `/models/${encodeURIComponent(rt.upstream_model)}` + (body.stream ? ':streamGenerateContent?alt=sse' : ':generateContent');
+        return { url: rt.providerCfg.base_url + path, payload: chatToGemini(body, rt.upstream_model, rt.providerCfg), headers };
+    }
     const payload = { ...body, model: rt.upstream_model };
-    // 实测有些上游的 /chat/completions 不认 OpenAI 新式的 role:"developer"，会回 422 "Endpoint is unavailable."
+    // 实测部分上游的 /chat/completions 不认 OpenAI 新式的 role:"developer"，会回 422 "Endpoint is unavailable."
     // （还骗过 PROTOCOL_HINT 让网关误换协议）。developer 与 system 等价，统一降级成 system 最稳；
     // responses / messages 两条路各自已把 developer 处理掉了，这里只管 chat。
     if (Array.isArray(payload.messages)) payload.messages = payload.messages.map((m) => (m && m.role === 'developer') ? { ...m, role: 'system' } : m);
@@ -990,24 +1217,211 @@ function chatToMessages(body, model, providerCfg) {
             name: t.function?.name, description: t.function?.description, input_schema: t.function?.parameters || { type: 'object', properties: {} },
         }));
     }
-    // 推理档位 → messages 端点。形状因上游而异：实测有些上游只认 thinking.type=adaptive + output_config.effort，
+    // 推理档位 → messages 端点。形状因上游而异：实测有的上游只认 thinking.type=adaptive + output_config.effort，
     // 发 thinking.type=enabled 直接 400。所以按 provider.thinking_style 走，缺省 none＝完全不发（宁可不带，也不 400）。
     if (body.thinking && typeof body.thinking === 'object') payload.thinking = body.thinking;
     if (body.output_config && typeof body.output_config === 'object') payload.output_config = body.output_config;
     const style = (providerCfg || {}).thinking_style || 'none';
     const eff = body.reasoning_effort;
     if (eff != null && style !== 'none') {
-        if (style === 'adaptive') {                      // 实测形状（某上游的 /messages）
+        if (style === 'adaptive') {                      // 实测形状（adaptive 上游的 /messages）
             if (!payload.thinking) payload.thinking = { type: 'adaptive' };
             if (!payload.output_config) payload.output_config = { effort: eff };
         } else if (style === 'enabled') {                 // Anthropic 原生：max_tokens 必须 > budget_tokens
-            const BUDGET = { minimal: 1024, low: 2048, medium: 8192, high: 16384 };
-            const budget = BUDGET[String(eff).toLowerCase()] || 8192;
+            // 档位 → 思考预算走全局 EFFORT_BUDGET（唯一来源，见「推理档位能力层」）。
+            // high 以上不能缺：max/ultra 漏在表外会静默按 medium 兜底（预算 8192），
+            // 客户端以为在「最强档」其实是最弱的一档。ultra 是 Hermes 内部档位，语义等同 max
+            // （对齐 agent/anthropic_adapter.py 的 ADAPTIVE_EFFORT_MAP: ultra→max）。
+            const effKey = String(eff).toLowerCase();
+            if (!(effKey in EFFORT_BUDGET)) log('推理档位未知，按 medium(8192) 兜底:', eff);
+            const budget = EFFORT_BUDGET[effKey] || 8192;
             if (payload.max_tokens <= budget) payload.max_tokens = budget + 4096;
             if (!payload.thinking) payload.thinking = { type: 'enabled', budget_tokens: budget };
         }
     }
     return payload;
+}
+
+// ---------------- Gemini（Google Generative Language）协议 ----------------
+// 用途：部分上游的 gemini-* 模型只认原生 Google 协议（/chat/completions、/responses、/messages 全回
+// 400 ModelProtocolUnsupported），必须按 contents/parts 发。这里只做「上游一侧」的翻译：
+//   请求  chat → generateContent 载荷        chatToGemini()
+//   流式  generateContent SSE → chat 事件     pumpGemini()
+//   非流   generateContent JSON → chat JSON   geminiToChatJson()
+// 客户端那侧仍是 chat（网关的 chat 中枢），所以 responses/messages 客户端也能间接受益，不需要额外实现。
+const GEMINI_THINKING_LEVELS = ['low', 'medium', 'high'];   // 实测：minimal/xhigh 直接 400，thinkingBudget 也不支持
+// 阶梯就近降级：gemini 只有三档，低了往上报、高了往下压（只降不升是上游侧原则，但 minimal 必须抬到 low 才不 400）
+function geminiThinkingLevel(effort) {
+    const e = String(effort || '').trim().toLowerCase();
+    if (!e) return null;
+    if (GEMINI_THINKING_LEVELS.includes(e)) return e;
+    const wi = EFFORT_LADDER.indexOf(e);
+    if (wi < 0) return null;                                   // 自定义档位名：不发，交给上游默认
+    const below = GEMINI_THINKING_LEVELS.filter((l) => EFFORT_LADDER.indexOf(l) <= wi);
+    return below.length ? below[below.length - 1] : GEMINI_THINKING_LEVELS[0];   // minimal → low
+}
+// chart 图片块 → inlineData（chat 的 image_url 可能是 data: URL，也可能是 http(s)，后者 Gemini 不收，直接丢）
+function geminiPartsOf(content) {
+    if (typeof content === 'string') return content ? [{ text: content }] : [];
+    if (!Array.isArray(content)) return content == null ? [] : [{ text: jdump(content) }];
+    const parts = [];
+    for (const p of content) {
+        if (p == null) continue;
+        if (typeof p === 'string') { if (p) parts.push({ text: p }); continue; }
+        if (p.type === 'text' && p.text) { parts.push({ text: p.text }); continue; }
+        const url = p.type === 'image_url' ? (p.image_url?.url || p.image_url) : p.type === 'image' ? (p.source?.data ? null : p.source?.url) : null;
+        const dataUrl = typeof url === 'string' && url.startsWith('data:') ? url : (p.source?.data ? `data:${p.source.media_type || 'image/png'};base64,${p.source.data}` : null);
+        if (dataUrl) {
+            const m = /^data:([^;,]+);base64,(.*)$/s.exec(dataUrl);
+            if (m) { parts.push({ inlineData: { mimeType: m[1], data: m[2] } }); continue; }
+        }
+        // 非 data: 的远程图片 URL：Gemini 原生只认 fileData（需先上传），这里退化成文本提示，避免整条请求 400
+        if (typeof url === 'string' && url) parts.push({ text: `[图片: ${url}]` });
+    }
+    return parts;
+}
+function chatToGemini(body, model, providerCfg) {
+    const msgs = body.messages || [];
+    const sysParts = [];
+    const contents = [];
+    // tool_call_id → 函数名：Gemini 的 functionResponse 必须带 name（不像 OpenAI 只认 call_id）
+    const nameByCall = new Map();
+    for (const m of msgs) for (const tc of m?.tool_calls || []) if (tc?.id) nameByCall.set(tc.id, tc.function?.name || '');
+    for (const m of msgs) {
+        if (!m || !m.role) continue;
+        if (m.role === 'system' || m.role === 'developer') { const t = textOf(m.content); if (t) sysParts.push({ text: t }); continue; }
+        if (m.role === 'tool') {                                    // 工具结果 → user 里的 functionResponse
+            const name = nameByCall.get(m.tool_call_id) || m.name || 'tool';
+            const resp = { name, response: { output: textOf(m.content) } };
+            if (m.tool_call_id) resp.id = m.tool_call_id;
+            contents.push({ role: 'user', parts: [{ functionResponse: resp }] });
+            continue;
+        }
+        if (m.role === 'assistant') {
+            const parts = [];
+            const t = textOf(m.content);
+            if (t) parts.push({ text: t });
+            for (const tc of m.tool_calls || []) {
+                if (!tc) continue;
+                const args = typeof tc.function?.arguments === 'string' ? safeJson(tc.function.arguments) : (tc.function?.arguments || {});
+                const fc = { name: tc.function?.name || '', args: args && typeof args === 'object' ? args : {} };
+                if (tc.id) fc.id = tc.id;
+                parts.push({ functionCall: fc });
+            }
+            if (parts.length) contents.push({ role: 'model', parts });
+            continue;
+        }
+        const parts = geminiPartsOf(m.content);                      // user
+        if (parts.length) contents.push({ role: 'user', parts });
+    }
+    const gen = {};
+    const maxTok = body.max_tokens ?? body.max_completion_tokens;
+    if (maxTok != null) gen.maxOutputTokens = maxTok;               // 实测思考 token 也计入这个上限
+    if (body.temperature != null) gen.temperature = body.temperature;
+    if (body.top_p != null) gen.topP = body.top_p;
+    if (body.stop != null) { const s = Array.isArray(body.stop) ? body.stop : [body.stop]; if (s.length) gen.stopSequences = s.slice(0, 5); }
+    const payload = { contents };
+    if (sysParts.length) payload.systemInstruction = { parts: sysParts };
+    if (Array.isArray(body.tools) && body.tools.length) {
+        const decls = body.tools.filter((t) => t.type === 'function' && t.function?.name).map((t) => ({
+            name: t.function.name,
+            ...(t.function.description ? { description: t.function.description } : {}),
+            // 实测 parameters 直接吃小写 JSON Schema（OpenAI 风），不用转大写 Type
+            parameters: t.function.parameters || { type: 'object', properties: {} },
+        }));
+        if (decls.length) payload.tools = [{ functionDeclarations: decls }];
+        const tc = body.tool_choice;
+        if (tc != null) {
+            if (tc === 'none') payload.toolConfig = { functionCallingConfig: { mode: 'NONE' } };
+            else if (tc === 'required' || tc === 'any') payload.toolConfig = { functionCallingConfig: { mode: 'ANY' } };
+            else if (tc === 'auto') payload.toolConfig = { functionCallingConfig: { mode: 'AUTO' } };
+            else if (typeof tc === 'object') {
+                const nm = tc.function?.name || tc.name;
+                if (nm) payload.toolConfig = { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: [nm] } };
+            }
+        }
+    }
+    // 推理档位：只有 provider.thinking_style 显式开（'gemini' / 'adaptive'）才发，缺省 none＝不发（宁可不带，也不 400）
+    const style = (providerCfg || {}).thinking_style || 'none';
+    const lvl = style === 'none' ? null : geminiThinkingLevel(body.reasoning_effort);
+    if (lvl) gen.thinkingConfig = { includeThoughts: true, thinkingLevel: lvl };
+    if (Object.keys(gen).length) payload.generationConfig = gen;
+    return payload;
+}
+const usageFromGemini = (u) => u ? {
+    in: u.promptTokenCount || 0,
+    out: u.candidatesTokenCount || 0,
+    total: u.totalTokenCount || ((u.promptTokenCount || 0) + (u.candidatesTokenCount || 0)),
+    cached: u.cachedContentTokenCount || 0,
+    reasoning: u.thoughtsTokenCount || 0,          // 思考 token 单独计（不算进 candidatesTokenCount）
+} : {};
+// 一帧 generateContent 响应 → 文本/思考/工具调用（流式与非流式共用）
+function geminiFrame(d, ctx, sink) {
+    if (!d || typeof d !== 'object') return;
+    if (d.error) { ctx.upstreamError = d.error.message || d.error.status || 'gemini upstream error'; return; }
+    if (d.usageMetadata) ctx.usage = usageFromGemini(d.usageMetadata);
+    if (d.promptFeedback?.blockReason) ctx.upstreamError = `内容被上游拦截: ${d.promptFeedback.blockReason}`;
+    for (const c of d.candidates || []) {
+        for (const p of c.content?.parts || []) {
+            if (typeof p.text === 'string' && p.text) sink.delta(p.thought ? { reasoning_content: p.text } : { content: p.text });
+            if (p.functionCall) {
+                const f = p.functionCall;
+                // Gemini 的 args 是对象、且整块到达（无增量）。这里必须分两次调用 sink：
+                // 三个 sink 的 tool() 都是 if(t.id)…else if(t.argsDelta)，一帧同时带 id 和参数会被丢掉（实测踩过）。
+                sink.tool({ id: f.id || randId('call_'), name: f.name || '' });
+                const argStr = jdump(f.args || {});
+                if (argStr) sink.tool({ argsDelta: argStr });   // args 是对象（OpenAI chat 要 JSON 字符串）
+            }
+        }
+        if (c.finishReason) ctx.gFinish = c.finishReason;
+    }
+}
+async function pumpGemini(upRes, ctx, sink) {          // :streamGenerateContent?alt=sse → sink
+    const reader = upRes.body.getReader(); const dec = new TextDecoder();
+    let buf = '';
+    const eat = (raw) => {
+        for (const line of raw.split('\n')) {
+            const s = line.trim();
+            if (!s || s.startsWith(':')) continue;
+            const payload = s.startsWith('data:') ? s.slice(5).trim() : (s.charAt(0) === '{' ? s : '');
+            if (!payload || payload === '[DONE]') continue;
+            let d; try { d = JSON.parse(payload); } catch { continue; }
+            geminiFrame(d, ctx, sink);
+        }
+    };
+    for (; ;) {
+        const { done, value } = await reader.read(); if (done) break;
+        if (value) ctx.up_res_bytes = (ctx.up_res_bytes || 0) + value.length;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) { const raw = buf.slice(0, i); buf = buf.slice(i + 2); eat(raw); }
+    }
+    if (buf.trim()) eat(buf);
+    if (ctx.gFinish === 'MAX_TOKENS') ctx.finishReason = 'length';
+}
+function geminiToChatJson(d, ctx) {                    // 非流式：整包 → chat completion
+    const texts = [], reasoning = [], toolCalls = [];
+    for (const c of d?.candidates || []) {
+        for (const p of c.content?.parts || []) {
+            if (typeof p.text === 'string' && p.text) (p.thought ? reasoning : texts).push(p.text);
+            if (p.functionCall) toolCalls.push({
+                id: p.functionCall.id || randId('call_'), type: 'function',
+                function: { name: p.functionCall.name || '', arguments: jdump(p.functionCall.args || {}) },
+            });
+        }
+        if (c.finishReason) ctx.gFinish = c.finishReason;
+    }
+    ctx.usage = usageFromGemini(d?.usageMetadata);
+    const blocked = d?.promptFeedback?.blockReason;
+    const msg = { role: 'assistant', content: texts.join('') || (toolCalls.length || blocked ? null : '') };
+    if (reasoning.length) msg.reasoning_content = reasoning.join('');
+    if (toolCalls.length) msg.tool_calls = toolCalls;
+    const fr = toolCalls.length ? 'tool_calls' : (ctx.gFinish === 'MAX_TOKENS' ? 'length' : 'stop');
+    return {
+        id: ctx.id, object: 'chat.completion', created: ctx.created, model: ctx.model,
+        choices: [{ index: 0, message: msg, finish_reason: fr }],
+        usage: usageToChat(ctx.usage),
+    };
 }
 
 // ---------------- Anthropic Messages -> chat ----------------
@@ -1517,6 +1931,9 @@ async function serveChatPipeline(req, res, opts) {
         } else if (format === 'messages') {
             if (body.stream) { if (!res.headersSent) res.writeHead(200, SSE_HEADERS); await pumpMessages(upRes, ctx, sink); }
             else { const d = await upRes.json(); renderJson(res, clientProto, messagesToChatJson(d, ctx), ctx); }
+        } else if (format === 'gemini') {
+            if (body.stream) { if (!res.headersSent) res.writeHead(200, SSE_HEADERS); await pumpGemini(upRes, ctx, sink); }
+            else { const d = await upRes.json(); ctx.up_res_bytes = Buffer.byteLength(jdump(d)); renderJson(res, clientProto, geminiToChatJson(d, ctx), ctx); }
         } else if (body.stream) {
             if (!res.headersSent) res.writeHead(200, SSE_HEADERS);
             if (clientProto === 'chat') {                 // chat→chat：原样字节透传（保持既有行为）
@@ -1612,6 +2029,22 @@ function providerIsTest(p) {
     if (p.test === false) return false;
     return isLocalBaseUrl(p.base_url);
 }
+function effortInfo(id) {
+    const rt = routeFor(String(id || ''));
+    if (!rt) return { effective: null, manual: null, manual_provider: null, probed: null, at: '', note: '', rejected: {} };
+    const k = effortKeyOf(rt.provider, rt.upstream_model);
+    const probe = (CFG.effort_probes || {})[k] || {};
+    const direct = normEfforts((CFG.model_efforts || {})[k]);
+    const wide = normEfforts((CFG.model_efforts || {})[effortKeyOf(rt.provider, '*')]);
+    const probed = normEfforts(probe.levels);
+    return {
+        effective: effortsFor(rt.provider, rt.upstream_model),
+        manual: direct.length ? direct : null,
+        manual_provider: wide.length ? wide : null,
+        probed: probed.length ? probed : null,
+        at: probe.at || '', note: probe.note || '', rejected: probe.rejected || {},
+    };
+}
 function configView() {
     const providers = Object.entries(CFG.providers || {}).map(([name, p]) => {
         const route = (CFG.routes || []).find((r) => r.provider === name && r.strip);
@@ -1627,6 +2060,7 @@ function configView() {
             models: (CFG.models || []).filter((m) => route && m.startsWith(route.strip)).length,
             test: providerIsTest(p),                       // 是否测试供应商（显式标记优先，否则按 base_url 推断）
             test_explicit: p.test !== undefined,           // 是否已显式写进 config.json
+            efforts: normEfforts((CFG.model_efforts || {})[effortKeyOf(name, '*')]),   // 该供应商的默认推理档位（模型级没配时生效）
         };
     });
     const MT = {};                                            // 每个模型的累计量（模型列表页显示用）
@@ -1643,6 +2077,7 @@ function configView() {
             auto: rt ? !!FORMAT_OVERRIDES[rt.provider + '|' + rt.upstream_model] : false,
             configured: rt ? !!(CFG.model_formats || {})[rt.provider + '|' + rt.upstream_model] : false,
             requests: st.requests || 0, in: st.in || 0, out: st.out || 0, cached: st.cached || 0,
+            effort: effortInfo(id),                    // 推理档位：生效/手工/探测/拒绝原因
         };
     });
     return {
@@ -1650,11 +2085,26 @@ function configView() {
         providers,
         routes: (CFG.routes || []).map((r) => ({ model_regex: r.model_regex, provider: r.provider, strip: r.strip || '', format: r.format || 'auto' })),
         models,
-        keys: (CFG.keys || []).map((k) => ({ name: k.name, protocol: k.protocol || '', interop: !!k.protocol_interop })),
+        keys: (CFG.keys || []).map((k) => ({ name: k.name, protocol: k.protocol || '', interop: !!k.protocol_interop, models: Array.isArray(k.models) ? k.models : [] })),
         formats: Object.keys(CFG.model_formats || {}).length,
         listen: CFG.listen,
         dashboard_hosts: (CFG.dashboard_auth || {}).hosts || [],
     };
+}
+// 客户端 key 的模型白名单校验：去空、去重、必须存在于对外模型清单。
+// 返回 [] 表示「全部模型」（等于不限制）；传 null/undefined 也当 []。
+function normKeyModels(input) {
+    if (input === null || input === undefined) return [];
+    if (!Array.isArray(input)) throw new Error('models 必须是模型名数组（空数组＝全部模型）');
+    const all = new Set(CFG.models || []);
+    const out = [];
+    for (const raw of input) {
+        const m = String(raw || '').trim();
+        if (!m) continue;
+        if (!all.has(m)) throw new Error('模型不存在: ' + m);
+        if (!out.includes(m)) out.push(m);
+    }
+    return out;
 }
 function applyConfigChange(p, b) {
     const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
@@ -1674,6 +2124,10 @@ function applyConfigChange(p, b) {
             ...(b.test !== undefined ? { test: !!b.test } : {}),
         };
         if (b.api_key) setEnvVar(envName, String(b.api_key).trim());
+        if (b.efforts !== undefined || b.reasoning_efforts !== undefined) {   // 供应商级默认推理档位（可选）
+            const lv = parseEffortsInput(b.efforts !== undefined ? b.efforts : b.reasoning_efforts);
+            if (lv.length) { cfg.model_efforts = cfg.model_efforts || {}; cfg.model_efforts[effortKeyOf(name, '*')] = lv; }
+        }
         const prefix = String(b.prefix || name).trim().replace(/\/+$/, '');
         cfg.routes = cfg.routes || [];
         if (!cfg.routes.some((r) => r.model_regex === prefixRe(prefix))) {
@@ -1723,6 +2177,16 @@ function applyConfigChange(p, b) {
             if (b.reasoning_echo) { if (!prov.reasoning_echo) { prov.reasoning_echo = true; changed.push('reasoning_echo(开)'); } }
             else if (prov.reasoning_echo) { delete prov.reasoning_echo; changed.push('reasoning_echo(关)'); }
         }
+        if (b.efforts !== undefined || b.reasoning_efforts !== undefined) {      // 供应商级默认推理档位（该供应商所有模型，模型级可覆盖）
+            const lv = parseEffortsInput(b.efforts !== undefined ? b.efforts : b.reasoning_efforts);
+            cfg.model_efforts = cfg.model_efforts || {};
+            const ek = effortKeyOf(name, '*');
+            const prev = normEfforts(cfg.model_efforts[ek]);
+            if (lv.length) {
+                cfg.model_efforts[ek] = lv;
+                if (jdump(prev) !== jdump(lv)) changed.push('推理档位 ' + lv.join('/'));
+            } else if (prev.length) { delete cfg.model_efforts[ek]; changed.push('推理档位(已清除)'); }
+        }
         if (b.test !== undefined) {
             const want = !!b.test;
             if (prov.test !== want) { prov.test = want; changed.push(want ? 'test(标记为测试)' : 'test(标记为正式)'); }
@@ -1744,10 +2208,15 @@ function applyConfigChange(p, b) {
         const existed = cfg.models.includes(full);
         if (!existed) cfg.models.push(full);
         const fmtKey = rt.provider + '|' + id;
-        const want = ['chat', 'responses', 'messages'].includes(b.format) ? b.format : '';
+        const want = ['chat', 'responses', 'messages', 'gemini'].includes(b.format) ? b.format : '';
         cfg.model_formats = cfg.model_formats || {};
         const prev = cfg.model_formats[fmtKey] || '';
         if (want) cfg.model_formats[fmtKey] = want; else delete cfg.model_formats[fmtKey];
+        if (b.efforts !== undefined || b.reasoning_efforts !== undefined) {   // 顺手指定该模型的推理档位（留空＝清除）
+            const lv = parseEffortsInput(b.efforts !== undefined ? b.efforts : b.reasoning_efforts);
+            cfg.model_efforts = cfg.model_efforts || {};
+            if (lv.length) cfg.model_efforts[fmtKey] = lv; else delete cfg.model_efforts[fmtKey];
+        }
         // 显式配置必须压过「首请求探测」的结果（resolveFormat 里探测优先级更高），否则改不动已有模型
         const hadProbe = !!FORMAT_OVERRIDES[fmtKey];
         if (hadProbe) { delete FORMAT_OVERRIDES[fmtKey]; saveOverrides(); }
@@ -1767,7 +2236,9 @@ function applyConfigChange(p, b) {
         const rt = (cfg.routes || []).find((r) => r.model_regex === prefixRe(prefix));
         if (!rt) throw new Error(`没有 prefix 为 ${prefix} 的路由，请先添加供应商`);
         cfg.models = cfg.models || [];
-        const want = ['chat', 'responses', 'messages'].includes(b.format) ? b.format : '';
+        const want = ['chat', 'responses', 'messages', 'gemini'].includes(b.format) ? b.format : '';
+        const effortsProvided = b.efforts !== undefined || b.reasoning_efforts !== undefined;
+        const effortsParsed = effortsProvided ? parseEffortsInput(b.efforts !== undefined ? b.efforts : b.reasoning_efforts) : [];
         let added = 0, updated = 0, clearedProbe = 0;
         for (const id of ids) {
             const full = prefix + '/' + id;
@@ -1776,11 +2247,38 @@ function applyConfigChange(p, b) {
             cfg.model_formats = cfg.model_formats || {};
             if (want) cfg.model_formats[fmtKey] = want; else delete cfg.model_formats[fmtKey];
             if (FORMAT_OVERRIDES[fmtKey]) { delete FORMAT_OVERRIDES[fmtKey]; clearedProbe++; }
+            if (effortsProvided) {                       // 批量指定同一档位（留空＝清除）
+                cfg.model_efforts = cfg.model_efforts || {};
+                if (effortsParsed.length) cfg.model_efforts[fmtKey] = effortsParsed; else delete cfg.model_efforts[fmtKey];
+            }
         }
         if (clearedProbe) saveOverrides();
         saveConfig(cfg); reloadConfig();
         log('CONFIG models bulk', prefix, `新增 ${added} / 覆盖 ${updated} / 清探测 ${clearedProbe}`);
         return { added, updated, skipped: updated, cleared_probe: clearedProbe, total: cfg.models.length, prefix };
+    }
+    if (p === '/api/config/model/efforts') {           // 手工指定某模型的推理档位（留空＝清除，回到探测/透传）
+        const id = String(b.id || '').trim();
+        const rt = routeFor(id);
+        if (!rt) throw new Error('模型未路由: ' + id);
+        const lv = parseEffortsInput(b.levels !== undefined ? b.levels : b.efforts);
+        cfg.model_efforts = cfg.model_efforts || {};
+        const ek = effortKeyOf(rt.provider, rt.upstream_model);
+        if (lv.length) cfg.model_efforts[ek] = lv; else delete cfg.model_efforts[ek];
+        saveConfig(cfg); reloadConfig();
+        log('CONFIG model efforts', id, lv.length ? lv.join('/') : '清除');
+        return { id, provider: rt.provider, upstream_model: rt.upstream_model, efforts: lv.length ? lv : null };
+    }
+    if (p === '/api/config/provider/efforts') {        // 供应商级默认推理档位（该供应商所有模型，模型级可覆盖）
+        const name = String(b.name || '').trim();
+        if (!(cfg.providers || {})[name]) throw new Error('供应商不存在: ' + name);
+        const lv = parseEffortsInput(b.levels !== undefined ? b.levels : b.efforts);
+        cfg.model_efforts = cfg.model_efforts || {};
+        const ek = effortKeyOf(name, '*');
+        if (lv.length) cfg.model_efforts[ek] = lv; else delete cfg.model_efforts[ek];
+        saveConfig(cfg); reloadConfig();
+        log('CONFIG provider efforts', name, lv.length ? lv.join('/') : '清除');
+        return { provider: name, efforts: lv.length ? lv : null };
     }
     if (p === '/api/config/provider/delete') {
         const name = String(b.name || '').trim();
@@ -1794,17 +2292,27 @@ function applyConfigChange(p, b) {
         const mf = cfg.model_formats || {};
         let removedFmt = 0;
         for (const k of Object.keys(mf)) if (k.startsWith(name + '|')) { delete mf[k]; removedFmt++; }
+        let removedEfforts = 0;                        // 档位：手工指定 + 探测缓存，都按 provider| 前缀清掉
+        for (const map of [cfg.model_efforts || {}, cfg.effort_probes || {}]) {
+            for (const k of Object.keys(map)) if (k.startsWith(name + '|')) { delete map[k]; removedEfforts++; }
+        }
         const envName = cfg.providers[name].api_key_env;
         delete cfg.providers[name];
         const stillUsed = Object.values(cfg.providers).some((pr) => pr && pr.api_key_env === envName);
         let envRemoved = false;
         if (envName && !stillUsed) { try { removeEnvVar(envName); envRemoved = true; } catch { } }
         saveConfig(cfg); reloadConfig();
-        return { removed_provider: name, removed_models: removedModels, removed_routes: routes.length, removed_formats: removedFmt, env_removed: envRemoved };
+        return { removed_provider: name, removed_models: removedModels, removed_routes: routes.length, removed_formats: removedFmt, removed_efforts: removedEfforts, env_removed: envRemoved };
     }
     if (p === '/api/config/model/delete') {
         const id = String(b.id || '').trim();
+        const rt = routeFor(id);
         cfg.models = (cfg.models || []).filter((m) => m !== id);
+        if (rt) {                                      // 顺带清掉这个模型的档位配置与探测缓存
+            const ek = effortKeyOf(rt.provider, rt.upstream_model);
+            if (cfg.model_efforts) delete cfg.model_efforts[ek];
+            if (cfg.effort_probes) delete cfg.effort_probes[ek];
+        }
         saveConfig(cfg); reloadConfig();
         return { removed: id };
     }
@@ -1813,10 +2321,21 @@ function applyConfigChange(p, b) {
         if (!/^[a-z0-9][a-z0-9_-]{0,30}$/i.test(name)) throw new Error('key 名只能字母数字-_（≤31 字符）');
         if ((cfg.keys || []).some((k) => k.name === name)) throw new Error('同名 key 已存在');
         const key = 'sk-gw-' + crypto.randomBytes(18).toString('base64url');
+        const models = normKeyModels(b.models);              // 空＝全部模型（默认）
         cfg.keys = cfg.keys || [];
-        cfg.keys.push({ name, key, session_id: crypto.randomUUID() });
+        cfg.keys.push({ name, key, session_id: crypto.randomUUID(), ...(models.length ? { models } : {}) });
         saveConfig(cfg); reloadConfig();
-        return { name, key };
+        return { name, key, models };
+    }
+    if (p === '/api/config/key/models') {              // 该 key 可访问的模型白名单：空数组/省略＝全部（默认）
+        const name = String(b.name || '').trim();
+        const k = (cfg.keys || []).find((x) => x.name === name);
+        if (!k) throw new Error('key 不存在: ' + name);
+        const models = normKeyModels(b.models);
+        if (models.length) k.models = models; else delete k.models;
+        saveConfig(cfg); reloadConfig();
+        log('CONFIG key models', name, models.length ? `${models.length} 个` : '全部');
+        return { key: name, models, config: configView() };
     }
     if (p === '/api/config/key/delete') {
         const name = String(b.name || '').trim();
@@ -1964,6 +2483,72 @@ async function upstreamBalance() {         // 上游余额接口（url / key 环
         return { ok: true, available: !!d.is_available, currency: b.currency || 'CNY', total: Number(b.total_balance || 0), granted: Number(b.granted_balance || 0), topped_up: Number(b.topped_up_balance || 0) };
     } catch (e) { return { ok: false, error: String((e && e.message) || e).slice(0, 160) }; }
 }
+// ---------------- 订阅周期（按月续费的额度窗口） ----------------
+// 口径：周期＝以「下次续费时刻」为锚点往前推的日历月。锚点优先取 quota.usage 返回的 monthly.resets_at，
+// 取不到就按记过的锚点顺推，再退回 quota.cycle_day（默认 1 号）。
+// allowance 口径＝实际成本 × base_usd ÷ 该模型月上限，所以「归一化额度 ÷ base_usd」与上游面板百分比同口径。
+const GO_BASE_USD = Number((CFG.quota && CFG.quota.base_usd) || 60) || 60;
+const GO_CYCLE_COUNT = Number((CFG.quota && CFG.quota.cycle_count) || 6) || 6;
+function monthShift(ms, n) {               // 日历月平移，月末溢出回退到目标月最后一天
+    const d = new Date(ms), day = d.getUTCDate();
+    d.setUTCDate(1);
+    d.setUTCMonth(d.getUTCMonth() + n);
+    const last = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+    d.setUTCDate(Math.min(day, last));
+    return d.getTime();
+}
+function usageCycleAnchor(quota) {         // 下次续费时刻（ms）；上游取不到就顺推上次记下的锚点
+    const iso = quota && quota.ok && quota.monthly && quota.monthly.resets_at;
+    const t = iso ? Date.parse(iso) : NaN;
+    if (Number.isFinite(t)) {
+        try { DB.prepare("INSERT OR REPLACE INTO meta(k,v) VALUES('quota_cycle_anchor',?)").run(String(t)); } catch { /* ignore */ }
+        return t;
+    }
+    const row = DB.prepare("SELECT v FROM meta WHERE k='quota_cycle_anchor'").get();
+    const prev = row ? Number(row.v) : NaN;
+    if (Number.isFinite(prev) && prev > 0) { let a = prev; while (a <= Date.now()) a = monthShift(a, 1); return a; }
+    const day = Math.min(28, Math.max(1, Number((CFG.quota || {}).cycle_day) || 1));   // 兜底：每月固定日
+    const now = new Date(), y = now.getUTCFullYear(), m = now.getUTCMonth();
+    const cand = Date.UTC(y, m, day);
+    return cand > now.getTime() ? cand : Date.UTC(y, m + 1, day);
+}
+function computeUsageCycles(anchorMs, count = GO_CYCLE_COUNT) {
+    const bounds = [];
+    for (let i = 0; i < count; i++) bounds.push({ lo: monthShift(anchorMs, -i - 1), hi: monthShift(anchorMs, -i) });
+    const oldest = bounds[bounds.length - 1].lo;
+    const out = bounds.map((b) => ({ start: b.lo, end: b.hi, reqs: 0, in: 0, out: 0, cached: 0, cost: 0, allow: 0, priced: 0, unpriced: 0, models: new Map() }));
+    const pfx = (CFG.quota || {}).provider_prefixes || [];
+    const cond = pfx.length ? ' AND (' + pfx.map(() => '(provider LIKE ? OR model LIKE ?)').join(' OR ') + ')' : '';
+    const rows = DB.prepare(`SELECT ts, model, provider, upstream_model, in_tok, out_tok, cached FROM requests
+        WHERE ts >= ?${cond}`).all(oldest, ...pfx.flatMap((p) => [p + '%', p + '%']));
+    for (const r of rows) {
+        const ts = r.ts || 0;
+        const e = out.find((c) => ts >= c.start && ts < c.end);
+        if (!e) continue;
+        const model = String(r.upstream_model || String(r.model || '').replace(/^[^/]*\//, ''));
+        const { cost, cap } = goModelCost(model, { in: r.in_tok || 0, out: r.out_tok || 0, cached: r.cached || 0 }, ts);
+        e.reqs++; e.in += r.in_tok || 0; e.out += r.out_tok || 0; e.cached += r.cached || 0;
+        if (cost == null) { e.unpriced++; continue; }          // 价格表里没有的模型只计请求数
+        e.priced++; e.cost += cost;
+        const allow = cap ? cost * GO_BASE_USD / cap : 0;      // cap=null → 不限额度
+        e.allow += allow;
+        const m = e.models.get(model) || { model, reqs: 0, in: 0, out: 0, cached: 0, cost: 0, allow: 0, cap };
+        m.reqs++; m.in += r.in_tok || 0; m.out += r.out_tok || 0; m.cached += r.cached || 0;
+        m.cost += cost; m.allow += allow; e.models.set(model, m);
+    }
+    return out.map((c) => ({
+        start: c.start, end: c.end, reqs: c.reqs, in: c.in, out: c.out, cached: c.cached,
+        cost: +c.cost.toFixed(4), allow: +c.allow.toFixed(4), pct: +(c.allow / GO_BASE_USD * 100).toFixed(2),
+        priced: c.priced, unpriced: c.unpriced,
+        models: [...c.models.values()].sort((a, b) => b.cost - a.cost).slice(0, 12)
+            .map((m) => ({
+                model: m.model, reqs: m.reqs, in: m.in, out: m.out, cached: m.cached,
+                cost: +m.cost.toFixed(4), allow: +m.allow.toFixed(4),
+                pct: m.cap ? +(m.cost / m.cap * 100).toFixed(2) : null,     // 占该模型自身月上限
+                cap: m.cap || null,
+            })),
+    }));
+}
 const QUOTA_TTL_MS = 5 * 60 * 1000;
 let QUOTA_CACHE = { t: 0, data: null };
 
@@ -2028,19 +2613,25 @@ const server = http.createServer(async (req, res) => {
         const want = String(url.searchParams.get('protocol') || '').toLowerCase();
         const bound = String(mA.protocol || '').toLowerCase();
         const isAnthropic = !!req.headers['anthropic-version'];
-        // 协议互转开启后每种客户端都能用每种模型；置 config.json 的 model_filter_protocol = false 即对所有客户端展示全量
-        const only = ['chat', 'responses', 'messages'].includes(want) ? want
+        // 协议互转已全通：每种客户端都能用每种模型。默认仍按协议过滤（保持旧行为）；
+        // 置 CFG.model_filter_protocol = false 即对所有客户端展示全量模型（?protocol= 显式指定始终优先）。
+        const only = ['chat', 'responses', 'messages', 'gemini'].includes(want) ? want
             : CFG.model_filter_protocol === false ? null
-                : ['chat', 'responses', 'messages'].includes(bound) ? bound
+                : ['chat', 'responses', 'messages', 'gemini'].includes(bound) ? bound
                     : isAnthropic ? 'messages'
                         : (keyProtocolHint(mA.name) === 'chat' ? null : keyProtocolHint(mA.name));   // 最近用 chat = 不过滤
-        const entries = (CFG.models || []).map((m) => {
+        // 模型白名单先过滤（key 级别）：被限制的 key 连「支持哪些模型」都只看得到自己的那几个。
+        const pool = (CFG.models || []).filter((m) => modelAllowed(mA, m));
+        const entries = pool.map((m) => {
             const { protocol, detected } = modelProtocol(m);
-            return { id: m, protocol, detected };
+            return { id: m, protocol, detected, efforts: effortsForModel(m) };
         }).filter((e) => !only || e.protocol === only);
         if (isAnthropic) {                                    // Anthropic 规范的模型列表形状
             return sendJson(res, 200, {
-                data: entries.map((e) => ({ type: 'model', id: e.id, display_name: e.id, created_at: '2026-01-01T00:00:00Z' })),
+                data: entries.map((e) => ({
+                    type: 'model', id: e.id, display_name: e.id, created_at: '2026-01-01T00:00:00Z',
+                    ...(e.efforts ? { reasoning_efforts: e.efforts } : {}),
+                })),
                 has_more: false,
                 first_id: entries.length ? entries[0].id : null,
                 last_id: entries.length ? entries[entries.length - 1].id : null,
@@ -2048,7 +2639,10 @@ const server = http.createServer(async (req, res) => {
         }
         return sendJson(res, 200, {
             object: 'list',
-            data: entries.map((e) => ({ id: e.id, object: 'model', owned_by: 'gateway', protocol: e.protocol, detected: e.detected })),
+            data: entries.map((e) => ({
+                id: e.id, object: 'model', owned_by: 'gateway', protocol: e.protocol, detected: e.detected,
+                ...(e.efforts ? { reasoning_efforts: e.efforts } : {}),
+            })),
         });
     }
     if (url.pathname === '/' || url.pathname === '/dashboard') {
@@ -2073,6 +2667,8 @@ const server = http.createServer(async (req, res) => {
             const ds = await upstreamBalance();
             const goQuota = await upstreamUsage();
             const go = computeGoUsage();
+            const anchor = usageCycleAnchor(goQuota);
+            const cycles = anchor ? computeUsageCycles(anchor) : null;
             QUOTA_CACHE = {
                 t: now,
                 data: {
@@ -2081,6 +2677,7 @@ const server = http.createServer(async (req, res) => {
                     usage: {
                         quota: goQuota,
                         detail_note: '网关侧明细：按 config.prices 里的单价 × 本网关记录的 token 估算，只覆盖走本网关的流量',
+                        cycle_stats: cycles ? { anchor, base: GO_BASE_USD, cycles } : null,
                         ...go,
                     },
                 },
@@ -2102,7 +2699,61 @@ const server = http.createServer(async (req, res) => {
             const v = url.searchParams.get('unit');
             return v === 'hour' || v === 'day' ? v : undefined;
         };
-        return sendJson(res, 200, statsSnapshot({ since: numParam('since'), until: numParam('until'), tz: numParam('tz'), unit: unitParam() }));
+        const dimParam = () => {
+            const v = url.searchParams.get('dim');
+            return v && DIM_EXPR[v] ? v : undefined;      // 只认 model / provider / key；其它值＝不分色（旧行为）
+        };
+        return sendJson(res, 200, statsSnapshot({ since: numParam('since'), until: numParam('until'), tz: numParam('tz'), unit: unitParam(), dim: dimParam() }));
+    }
+
+    // ---------------- 推理档位探测（面板） ----------------
+    if (url.pathname === '/api/probe/efforts' || url.pathname === '/api/probe/efforts/bulk') {
+        if (!dashOk && !authenticate(req)) return sendJson(res, 401, { error: { message: 'unauthorized', type: 'invalid_request_error' } });
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { message: 'POST only' } });
+        let b = {};
+        try { b = JSON.parse((await readBody(req)) || '{}'); } catch { return sendJson(res, 400, { error: { message: 'invalid json' } }); }
+        try {
+            const lv = b.levels ? parseEffortsInput(b.levels) : undefined;
+            if (url.pathname === '/api/probe/efforts') {
+                const out = await probeModelEfforts(b.id, { levels: lv, timeout: b.timeout });
+                return sendJson(res, 200, { ok: true, ...out, config: configView() });
+            }
+            // 批量：一次最多 20 个模型，串行探测（不并发打上游），最后一次写盘（免得刷一堆 config 备份）
+            const provider = String(b.provider || '').trim();
+            const onlyUnprobed = b.only_unprobed !== false;
+            const limit = Math.min(Math.max(Number(b.limit) || 5, 1), 20);
+            let ids = Array.isArray(b.ids) && b.ids.length ? b.ids.map(String) : (CFG.models || []);
+            ids = ids.filter((id) => {
+                const rt = routeFor(id);
+                if (!rt) return false;
+                if (provider && rt.provider !== provider) return false;
+                if (onlyUnprobed) {
+                    const k = effortKeyOf(rt.provider, rt.upstream_model);
+                    if (normEfforts((CFG.effort_probes || {})[k] && (CFG.effort_probes || {})[k].levels).length) return false;
+                    if (normEfforts((CFG.model_efforts || {})[k]).length) return false;
+                }
+                return true;
+            });
+            const picked = ids.slice(0, limit);
+            const results = [];
+            for (const id of picked) {
+                try { results.push(await probeModelEfforts(id, { persist: false, levels: lv, timeout: b.timeout })); }
+                catch (e) { results.push({ id, error: e.message }); }
+            }
+            const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+            cfg.effort_probes = cfg.effort_probes || {};
+            let saved = 0;
+            for (const r of results) {
+                if (r.error) continue;
+                cfg.effort_probes[effortKeyOf(r.provider, r.upstream_model)] = {
+                    levels: r.levels, rejected: r.rejected, saw_reasoning: r.saw_reasoning,
+                    format: r.format, thinking_style: r.thinking_style, at: r.at, note: r.note,
+                };
+                saved++;
+            }
+            if (saved) { saveConfig(cfg); reloadConfig(); }
+            return sendJson(res, 200, { ok: true, probed: results.length, saved, remaining: Math.max(0, ids.length - picked.length), results, config: configView() });
+        } catch (e) { return sendJson(res, 400, { error: { message: e.message } }); }
     }
 
     // ---------------- 配置读写（面板密码通过 或 虚拟 key） ----------------
@@ -2136,6 +2787,7 @@ const server = http.createServer(async (req, res) => {
                     has_key: !!(process.env[p.api_key_env] || '').length,
                     user_agent: p.user_agent || '',
                     reasoning_echo: !!p.reasoning_echo,
+                    efforts: normEfforts((CFG.model_efforts || {})[effortKeyOf(name, '*')]),
                     test: providerIsTest(p),
                     extra_headers: p.extra_headers || {},
                     models: (CFG.models || []).filter((m) => rt && m.startsWith(rt.strip)).length,
@@ -2149,6 +2801,113 @@ const server = http.createServer(async (req, res) => {
             log('CONFIG', url.pathname, JSON.stringify(out).slice(0, 200));
             return sendJson(res, 200, { ok: true, ...out, config: configView() });
         } catch (e) { return sendJson(res, 400, { error: { message: e.message } }); }
+    }
+    // ---------- 原生 Gemini 直通：客户端自带 Google 协议时原样转发（不做翻译）----------
+    // 形状：/v1beta/models/<model>:generateContent 与 :streamGenerateContent[?alt=sse]
+    // （同时接受 /v1/models/... 前缀，Google SDK 两种 base_url 都见过）
+    // 模型名可能自带前缀斜杠（对外名形如 ocg/gemini-...），所以这里不能用 [^/:]+ 排除斜杠
+    const gemHit = /^\/(?:v1beta|v1)\/models\/(.+):(generateContent|streamGenerateContent)$/.exec(url.pathname);
+    if (gemHit) {
+        if (req.method !== 'POST') {
+            log('404', req.method, url.pathname, 'host=' + host);
+            return sendJson(res, 404, { error: { message: 'not found', type: 'invalid_request_error' } });
+        }
+        if (!isEnabled()) return sendJson(res, 503, { error: { message: GATEWAY_OFF_MSG, type: 'service_unavailable', code: 'gateway_disabled' } });
+        const t0 = Date.now();
+        const gAuth = authenticate(req);        // 两种头都认：Bearer / x-api-key（Google SDK 通常发 x-goog-api-key，见下）
+        if (!gAuth) return sendJson(res, 401, { error: { code: 401, status: 'UNAUTHENTICATED', message: 'Invalid API key' } });
+        let gRaw = '', gBody = {};
+        try {
+            gRaw = await readBody(req);
+            gBody = gRaw ? JSON.parse(gRaw) : {};
+        } catch { return sendJson(res, 400, { error: { code: 400, status: 'INVALID_ARGUMENT', message: 'invalid json body' } }); }
+        const gModel = decodeURIComponent(gemHit[1]);
+        if (!modelAllowed(gAuth, gModel)) {          // key 的模型白名单
+            log('DENY model', gAuth.name, gModel, '(白名单) gemini');
+            record({ ts: t0, key: gAuth.name, model: gModel, stream: gemHit[2] === 'streamGenerateContent', ip: clientIp(req), passthrough: true, cproto: 'gemini', req_bytes: Buffer.byteLength(gRaw || ''), status: 403, ms: Date.now() - t0, provider: null, error: 'model_not_allowed' });
+            return sendJson(res, 403, { error: { code: 403, status: 'PERMISSION_DENIED', message: `model "${gModel}" is not allowed for this key` } });
+        }
+        const gRt = routeFor(gModel);
+        const gStream = gemHit[2] === 'streamGenerateContent';
+        const gBase = { ts: t0, key: gAuth.name, model: gModel, stream: gStream, ip: clientIp(req), passthrough: true, cproto: 'gemini', conv: convFingerprint(gBody), req_bytes: Buffer.byteLength(gRaw || ''), res_bytes: 0, up_res_bytes: 0 };
+        countOut(res, gBase);
+        if (!gRt) {
+            record({ ...gBase, status: 400, ms: Date.now() - t0, provider: null });
+            return sendJson(res, 400, { error: { code: 400, status: 'INVALID_ARGUMENT', message: `model "${gModel}" not routed` } });
+        }
+        const gUpFmt = resolveFormat(gRt);
+        // 上游不是 gemini 协议时不转：这一版只做「chat 客户端 → gemini 上游」，跨协议翻译先不做
+        if (gUpFmt !== 'gemini') {
+            record({ ...gBase, status: 400, ms: Date.now() - t0, provider: gRt.provider, error: 'upstream format is ' + gUpFmt });
+            return sendJson(res, 400, { error: { code: 400, status: 'FAILED_PRECONDITION', message: `模型 ${gModel} 的上游协议是 ${gUpFmt}，不是 gemini；Gemini 原生客户端目前只支持打 gemini 协议的上游` } });
+        }
+        const gHeaders = upstreamHeaders(gRt.providerCfg, gAuth.session_id, gStream ? 'text/event-stream' : 'application/json', 'gemini');
+        // 客户端带来的生成参数原样保留，只把 model 从路径里的对外名换成上游名
+        const gPayload = { ...gBody };
+        const gUrl = gRt.providerCfg.base_url + '/models/' + encodeURIComponent(gRt.upstream_model) + ':' + gemHit[2] + (gStream ? '?alt=sse' : '');
+        capture('client_req', { cproto: 'gemini', ip: clientIp(req), key: gAuth.name, model: gModel, stream: gStream, body: gBody });
+        capture('upstream_req', { cproto: 'gemini', url: gUrl, key: gAuth.name, model: gModel, upstream_model: gRt.upstream_model, payload: gPayload });
+        try {
+            const ac = new AbortController();
+            const onClose = () => { if (!res.writableEnded) { try { ac.abort(); } catch { } } };
+            req.on('close', onClose);
+            const up = await fetch(gUrl, { method: 'POST', headers: gHeaders, body: jdump(gPayload), signal: ac.signal });
+            capture('upstream_status', { cproto: 'gemini', status: up.status, ok: up.ok });
+            req.off('close', onClose);
+            if (!up.ok) {
+                const txt = await up.text();
+                let parsed = null; try { parsed = JSON.parse(txt); } catch { }
+                log('PASSTHROUGH ERROR', up.status, gRt.provider, 'gemini', gModel, txt.slice(0, 250));
+                record({ ...gBase, status: up.status, ms: Date.now() - t0, provider: gRt.provider, upstream_model: gRt.upstream_model, format: 'gemini', error: txt.slice(0, 500) });
+                return sendJson(res, up.status, parsed?.error ? parsed : { error: { code: up.status, message: txt.slice(0, 800) || 'upstream error' } });
+            }
+            if (gStream) {
+                if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
+                let buf = '', ttft = null, usage = {}, lastEvt = '';
+                const dec = new StringDecoder('utf8');
+                const reader = up.body.getReader();
+                const eat = (raw) => {
+                    for (const line of raw.split('\n')) {
+                        const s = line.trim();
+                        if (!s) continue;
+                        const p = s.startsWith('data:') ? s.slice(5).trim() : s;
+                        if (!p || p === '[DONE]') continue;
+                        let d; try { d = JSON.parse(p); } catch { continue; }
+                        if (d.usageMetadata) usage = usageFromGemini(d.usageMetadata);
+                        if (d.candidates?.[0]?.finishReason) lastEvt = d.candidates[0].finishReason;
+                        if (d.error) lastEvt = 'error';
+                    }
+                };
+                for (; ;) {
+                    const { done, value } = await reader.read(); if (done) break;
+                    if (!value) continue;
+                    gBase.up_res_bytes += value.length;
+                    if (ttft == null) ttft = Date.now() - t0;
+                    buf += dec.write(Buffer.from(value));      // StringDecoder 吃 Buffer，不能直接喂 Uint8Array
+                    let i;
+                    while ((i = buf.indexOf('\n\n')) >= 0) { const raw = buf.slice(0, i); buf = buf.slice(i + 2); eat(raw); res.write(raw + '\n\n'); }   // 逐字节回吐（保真）
+                }
+                buf += dec.end();
+                if (buf.trim()) { eat(buf); res.write(buf); }
+                res.end();
+                record({ ...gBase, status: 200, ms: Date.now() - t0, provider: gRt.provider, upstream_model: gRt.upstream_model, format: 'gemini', usage, ttft_ms: ttft || 0, usage_src: Object.keys(usage).length ? 'stream' : 'missing', last_evt: lastEvt });
+                log('OK', 'gemini->gemini(直通)', gRt.upstream_model, `in=${usage.in || 0} out=${usage.out || 0}`, `${Date.now() - t0}ms`);
+            } else {
+                const txt = await up.text();
+                let usage = {};
+                try { const d = JSON.parse(txt); usage = usageFromGemini(d.usageMetadata); } catch { }
+                res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(txt) });
+                res.end(txt);
+                record({ ...gBase, status: 200, ms: Date.now() - t0, provider: gRt.provider, upstream_model: gRt.upstream_model, format: 'gemini', usage, ttft_ms: 0, usage_src: Object.keys(usage).length ? 'body' : 'missing', up_res_bytes: Buffer.byteLength(txt) });
+                log('OK', 'gemini->gemini(直通)', gRt.upstream_model, `in=${usage.in || 0} out=${usage.out || 0}`, `${Date.now() - t0}ms`);
+            }
+        } catch (e) {
+            log('PASSTHROUGH ERROR', 'gemini', gRt.provider, gModel, e.message);
+            record({ ...gBase, status: 502, ms: Date.now() - t0, provider: gRt.provider, upstream_model: gRt.upstream_model, format: 'gemini', error: 'fetch failed: ' + e.message });
+            if (!res.headersSent) return sendJson(res, 502, { error: { code: 502, status: 'UNAVAILABLE', message: 'upstream fetch failed: ' + e.message } });
+            try { res.end(); } catch { }
+        }
+        return;
     }
     // ---------- 原生协议直通：客户端自带 responses / messages 协议时原样转发（不做翻译）----------
     if (url.pathname === '/v1/responses' || url.pathname === '/v1/messages') {
@@ -2165,8 +2924,13 @@ const server = http.createServer(async (req, res) => {
         let pBody;
         let pRaw = '';
         try { pRaw = await readBody(req); pBody = JSON.parse(pRaw); } catch { return sendJson(res, 400, { error: { message: 'invalid json body', type: 'invalid_request_error' } }); }
+        if (!modelAllowed(pAuth, pBody.model)) {      // key 的模型白名单（原生直通 + 互转都走这里）
+            log('DENY model', pAuth.name, pBody.model, '(白名单)', kind);
+            record({ ts: t0, key: pAuth.name, model: pBody.model, stream: !!pBody.stream, ip: clientIp(req), passthrough: true, cproto: kind, conv: convFingerprint(pBody), req_bytes: Buffer.byteLength(pRaw || ''), status: 403, ms: Date.now() - t0, provider: null, error: 'model_not_allowed' });
+            return sendJson(res, 403, { error: { message: `model "${pBody.model}" is not allowed for this key`, type: 'invalid_request_error', code: 'model_not_allowed' } });
+        }
         const pRt = routeFor(pBody.model);
-        const pBase = { ts: t0, key: pAuth.name, model: pBody.model, stream: !!pBody.stream, ip: clientIp(req), passthrough: true, conv: convFingerprint(pBody), req_bytes: Buffer.byteLength(pRaw || ''), res_bytes: 0, up_res_bytes: 0 };
+        const pBase = { ts: t0, key: pAuth.name, model: pBody.model, stream: !!pBody.stream, ip: clientIp(req), passthrough: true, cproto: kind, conv: convFingerprint(pBody), req_bytes: Buffer.byteLength(pRaw || ''), res_bytes: 0, up_res_bytes: 0 };
         countOut(res, pBase);
         if (!pRt) { record({ ...pBase, status: 400, ms: Date.now() - t0, provider: null }); return sendJson(res, 400, { error: { message: `model "${pBody.model}" not routed`, type: 'invalid_request_error' } }); }
         // 协议互转（按 key 开关 keys[].protocol_interop，默认关；看板「客户端 key」页可勾）：开启时
@@ -2180,7 +2944,7 @@ const server = http.createServer(async (req, res) => {
         for (const hn of Object.keys(req.headers)) {                 // 把客户端的协议头原样带上去（anthropic-beta / openai-beta / x-stainless-*）
             if (/^(anthropic-|openai-beta|x-stainless)/i.test(hn)) pHeaders[hn] = String(req.headers[hn]);
         }
-        const pPayload = { ...pBody, model: pRt.upstream_model };     // 只换模型名，输入原样（含客户端自己回传的 reasoning item）
+        const pPayload = { ...clampBodyEffort(pBody, pRt), model: pRt.upstream_model };     // 只换模型名 + 档位就近降级，输入原样（含客户端自己回传的 reasoning item）
         if (pRt.providerCfg.reasoning_echo && kind === 'responses' && Array.isArray(pBody.input)) {
             const inj = injectReasonsIntoInput(pBody.input, pRt.provider);   // 客户端没回传的那几条，由网关补上（只补缺的、不重复、且只在同一供应商内）
             if (inj.injected) { pPayload.input = inj.input; pBase.reason_inj = inj.injected; log('[reason] 直通补回', inj.injected, '条 ->', pBody.model); }
@@ -2276,12 +3040,14 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname.startsWith('/v1/models/')) {                 // 单模型查询（客户端常见探活）
         const id = decodeURIComponent(url.pathname.slice('/v1/models/'.length));
-        if (!authenticate(req)) return sendJson(res, 401, { error: { message: 'Invalid API key', type: 'invalid_request_error', code: 'invalid_api_key' } });
-        if (!(CFG.models || []).includes(id)) {          // 只认对外声明的模型清单（路由表有 `.` 兜底，不能用 routeFor 判断存在性）
+        const mAuth = authenticate(req);
+        if (!mAuth) return sendJson(res, 401, { error: { message: 'Invalid API key', type: 'invalid_request_error', code: 'invalid_api_key' } });
+        if (!(CFG.models || []).includes(id) || !modelAllowed(mAuth, id)) {   // 只认对外声明的模型清单（路由表有 `.` 兜底，不能用 routeFor 判断存在性）；白名单外一律当作不存在
             return sendJson(res, 404, { error: { message: 'model not found: ' + id, type: 'invalid_request_error', code: 'model_not_found' } });
         }
         const info = modelProtocol(id);
-        return sendJson(res, 200, { id, object: 'model', owned_by: 'gateway', protocol: info.protocol, detected: info.detected });
+        const eff = effortsForModel(id);
+        return sendJson(res, 200, { id, object: 'model', owned_by: 'gateway', protocol: info.protocol, detected: info.detected, ...(eff ? { reasoning_efforts: eff } : {}) });
     }
     if (url.pathname !== '/v1/chat/completions' || req.method !== 'POST') {
         // 404 不记统计，容易被当成“连不上”却查无实据 → 记下方法/路径/来源，便于定位客户端配错
@@ -2298,6 +3064,11 @@ const server = http.createServer(async (req, res) => {
     let body;
     let rawBody = '';
     try { rawBody = await readBody(req); body = JSON.parse(rawBody); } catch { return sendJson(res, 400, { error: { message: 'invalid json body', type: 'invalid_request_error' } }); }
+    if (!modelAllowed(auth, body.model)) {         // key 的模型白名单：不让用的模型直接 403（不走到上游，不烧额度）
+        record({ ts: t0, key: auth.name, model: body.model, stream: !!body.stream, ip: clientIp(req), cproto: 'chat', req_bytes: Buffer.byteLength(rawBody || ''), status: 403, ms: Date.now() - t0, provider: null, error: 'model_not_allowed' });
+        log('DENY model', auth.name, body.model, '(白名单)');
+        return sendJson(res, 403, { error: { message: `model "${body.model}" is not allowed for this key`, type: 'invalid_request_error', code: 'model_not_allowed' } });
+    }
     const rt = routeFor(body.model);
     if (!rt) {
         record({ ts: t0, key: auth.name, model: body.model, stream: !!body.stream, ip: clientIp(req), cproto: 'chat', req_bytes: Buffer.byteLength(rawBody || ''), status: 400, ms: Date.now() - t0, provider: null });

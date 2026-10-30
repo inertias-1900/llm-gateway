@@ -6,7 +6,7 @@
 <meta name="theme-color" content="#000000">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<title>最小化 LLM 网关</title>
+<title>LLM 网关</title>
 <style>
   :root{
     --bg:#000; --panel:#080706; --panel2:#100d09; --line:#4a3b28; --line2:#2a2117;
@@ -15,6 +15,7 @@
     --btn:#171208; --btn2:#1a1408; --btn3:#1d160c; --inputbg:#000; --toastbg:#141009;
     --onfg:#000; --dangerline:#5b2a26; --dangerbg:rgba(255,107,97,.08); --hover:rgba(255,176,0,.07);
     --colline:#2a2117; --headwash:rgba(255,176,0,.12);
+    --s1:#ffb000; --s2:#8ad9c6; --s3:#cba7ff; --s4:#ff8c42; --s5:#a8d47f; --s6:#7fb0ff; --s7:#ff9ec4; --s8:#d9c07a; --sx:#5f564d;
     --fs:15px;              /* 基准字号，顶栏可切换 */
   }
   /* 亮色主题：暖纸底 + 琥珀强调（顶栏可切换，存 localStorage） */
@@ -25,6 +26,7 @@
     --btn:#e8dfcc; --btn2:#f2e8d5; --btn3:#f5ecda; --inputbg:#fffdf7; --toastbg:#3a3227;
     --onfg:#fff8ec; --dangerline:#d8a79f; --dangerbg:rgba(176,53,42,.08); --hover:rgba(160,90,0,.10);
     --colline:#e4dac6; --headwash:rgba(160,90,0,.10);
+    --s1:#9c5a00; --s2:#0d6f63; --s3:#6741b8; --s4:#bf5518; --s5:#3b7318; --s6:#1f5fa8; --s7:#a8457a; --s8:#8a6d1f; --sx:#8d8172;
   }
   *{box-sizing:border-box}
   html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
@@ -86,8 +88,15 @@
   .amber{color:var(--amber)} .green{color:var(--green)} .red{color:var(--red)}
   .dim{color:var(--dim2)} .cyan{color:var(--cyan)} .orange{color:var(--orange)} .violet{color:var(--violet)}
   .bar{height:64px;display:flex;align-items:flex-end;gap:2px}
-  .bar .col{flex:1;background:linear-gradient(180deg,var(--amber),rgba(255,140,66,.3));min-height:2px}
-  .bar .col:hover{background:var(--orange)}
+  .bar .col{flex:1;display:flex;flex-direction:column-reverse;min-height:2px;cursor:default}
+  .bar .col>.sg{width:100%;background:var(--s1)}
+  .bar .col>.sg.solo{background:linear-gradient(180deg,var(--amber),rgba(255,140,66,.3))}
+  .bar .col>.sg:hover{filter:brightness(1.4)}
+  .bar .col:hover>.sg{filter:brightness(1.12)}
+  .legend{display:flex;flex-wrap:wrap;gap:3px 14px;margin-top:6px;font-size:calc(var(--fs)*0.78);color:var(--dim2)}
+  .legend .lg{display:inline-flex;align-items:center;gap:5px}
+  .legend .lg i{width:9px;height:9px;display:inline-block}
+  #stack_key{font-size:calc(var(--fs)*0.85);padding:2px 6px;width:auto;max-width:230px}
   .axis{display:flex;justify-content:space-between;color:var(--dim2);font-size:calc(var(--fs)*0.78);margin-top:3px}
   .dot{width:10px;height:10px;border-radius:50%;display:inline-block}
   .ok{background:var(--green);box-shadow:0 0 8px var(--green)} .bad{background:var(--red);box-shadow:0 0 8px var(--red)}
@@ -103,6 +112,10 @@
   .hint{color:var(--dim2);font-size:calc(var(--fs)*0.84)}
   .msg{padding:8px 0;color:var(--dim2)}
   .pill{border:1px solid var(--line);padding:1px 7px;font-size:calc(var(--fs)*0.78);color:var(--dim2)}
+  .eff{border:1px solid var(--line2);padding:0 5px;margin:0 3px 2px 0;font-size:calc(var(--fs)*0.75);color:var(--amber);white-space:nowrap;display:inline-block}
+  .eff.off{color:var(--dim2);border-style:dashed}
+  .effrow{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;max-width:230px}
+  .effbtns{margin-top:2px;white-space:nowrap}
   .pill.t,.pill.f{cursor:pointer}
   .pill.t{border-color:var(--amber);color:var(--amber)}
   .pill.f{color:var(--dim2)}
@@ -119,6 +132,23 @@
     line-height:1.0;font-size:calc(var(--fs)*0.76)}
   .tcell .p{font-size:calc(var(--fs)*0.62);color:var(--dim2)}
   .hidden{display:none !important}
+  /* 模型白名单弹层（客户端 key 页） */
+  .ovl{position:fixed;inset:0;z-index:60;background:rgba(0,0,0,.62);display:flex;align-items:center;justify-content:center;padding:14px}
+  .ovlbox{background:var(--panel);border:1px solid var(--line);border-radius:10px;width:100%;max-width:780px;max-height:88vh;
+    display:flex;flex-direction:column;box-shadow:0 12px 40px rgba(0,0,0,.55)}
+  .ovlh{display:flex;align-items:center;gap:10px;padding:11px 14px;border-bottom:1px solid var(--colline);
+    font-weight:700;color:var(--amber);background:var(--headwash);border-radius:10px 10px 0 0}
+  .ovlh .line{flex:1;height:1px;background:var(--line2)}
+  .ovlb{padding:12px 14px;overflow:auto}
+  .ovlf{display:flex;align-items:center;gap:10px;padding:10px 14px;border-top:1px solid var(--colline);flex-wrap:wrap}
+  .kmodbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+  .kmodbar input{width:auto;min-width:180px;max-width:260px}
+  .kmodlist{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:1px 10px}
+  .kmodlist label{display:flex;gap:7px;align-items:center;padding:4px 6px;border-radius:5px;cursor:pointer;
+    font-size:calc(var(--fs)*0.86);word-break:break-all}
+  .kmodlist label:hover{background:var(--hover)}
+  .kmodlist input{width:auto;margin:0}
+  @media (max-width:820px){ .kmodlist{grid-template-columns:1fr} }
   code{color:var(--cyan);word-break:break-all}
   .gwtoggle{background:var(--btn);border:1px solid var(--line);color:var(--dim2);font:inherit;
     font-size:calc(var(--fs)*0.92);padding:5px 14px;cursor:pointer}
@@ -288,8 +318,10 @@
           <div class="s" id="t_lat_s">-</div></div>
       </div>
       <div class="box">
-        <div class="h"><span id="chart_title">输入 tokens</span><span class="line"></span><span class="dim" id="chart_sub">按本地时间</span><span id="h24s" class="dim"></span></div>
-        <div class="b"><div class="bar" id="bar"></div><div class="axis" id="axis"></div></div>
+        <div class="h"><span id="chart_title">输入 tokens</span>
+          <select id="stack_key" title="柱状图按客户端 key 分色：默认全部 key 聚合显示总量，选单个 key 只看它的用量"></select>
+          <span class="line"></span><span class="dim" id="chart_sub">按本地时间</span><span id="h24s" class="dim"></span></div>
+        <div class="b"><div class="bar" id="bar"></div><div class="axis" id="axis"></div><div class="legend" id="legend"></div></div>
       </div>
       <div class="box" style="margin-top:10px">
         <div class="h">上游额度<span class="line"></span><span class="dim" id="q_at"></span>
@@ -382,6 +414,9 @@
         <div style="display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap">
           <input id="m_search" placeholder="搜索：模型名 / 供应商 / 协议…" style="max-width:360px">
           <select id="m_filter" style="max-width:220px"><option value="">全部供应商</option></select>
+          <button class="act" id="m_probe_unprobed" title="对还没有档位信息的模型逐个探测（串行、每次 5 个、不并发打上游）。探测会给上游发 7 个最小请求。">探测未探测的模型</button>
+          <button class="act" id="m_probe_shown" title="对当前筛选出来的模型重新探测一遍（会覆盖已有探测结果，手工指定的不动）">重探当前筛选</button>
+          <span class="hint" id="m_probeinfo"></span>
         </div>
         <div class="tblwrap"><table id="tbl_models"></table></div>
       </div>
@@ -424,6 +459,8 @@
           <div class="field"><label>额外请求头（JSON，可选）</label><input id="p_hdr" placeholder='{"x-upstream-session":"__SESSION__"}'></div>
           <div class="field"><label>推理链回灌（chat↔responses 桥接时把 reasoning 项插回，保住思维链）</label>
             <label style="display:flex;gap:8px;align-items:center;color:var(--text)"><input type="checkbox" id="p_echo" style="width:auto"> 开启 reasoning_echo</label></div>
+          <div class="field"><label>默认推理档位（该供应商所有模型；逗号分隔，留空＝不干预）</label>
+            <input id="p_efforts" placeholder="low, medium, high, max（可用的：minimal / low / medium / high / xhigh / max / ultra）"></div>
           <div class="field"><label>测试供应商（列表里归到「测试供应商」分组，默认折叠）</label>
             <label style="display:flex;gap:8px;align-items:center;color:var(--text)"><input type="checkbox" id="p_test" style="width:auto"> 标记为测试供应商</label></div>
           <button class="act" id="p_submit">保存供应商</button>
@@ -456,22 +493,27 @@
                 <option value="chat">chat（/chat/completions）</option>
                 <option value="responses">responses（/responses）</option>
                 <option value="messages">messages（Anthropic）</option>
+                <option value="gemini">gemini（Google 原生 generateContent）</option>
               </select>
+              <input id="mm_bulk_efforts" placeholder="推理档位（可选，如 low,high,max）" style="max-width:280px">
               <button class="act" id="mm_bulkadd">添加所选</button>
             </div>
           </div>
 
           <div class="hint" style="margin:14px 0 8px;border-top:1px dotted var(--line2);padding-top:10px">手动单个添加</div>
-          <div class="field"><label>模型 ID（上游真实名字）</label><input id="mm_id" placeholder="my-model-1"></div>
+          <div class="field"><label>模型 ID（上游真实名字）</label><input id="mm_id" placeholder="upstream-model-id"></div>
           <div class="field"><label>协议</label>
             <select id="mm_fmt">
               <option value="">自动探测（推荐）</option>
               <option value="chat">chat（/chat/completions）</option>
               <option value="responses">responses（/responses）</option>
               <option value="messages">messages（Anthropic）</option>
+              <option value="gemini">gemini（Google 原生 generateContent）</option>
             </select></div>
+          <div class="field"><label>推理档位（可选，逗号分隔；留空＝按探测结果/不干预）</label>
+            <input id="mm_efforts" placeholder="low, medium, high, max"></div>
           <button class="act" id="mm_submit">添加 / 覆盖模型</button>
-          <div class="hint" style="margin-top:12px">协议留空＝自动探测：首次请求按 chat→responses→messages 依次试，成功即记住。<br>
+          <div class="hint" style="margin-top:12px">协议留空＝自动探测：首次请求按 chat→responses→messages→gemini 依次试，成功即记住。<br>
             模型已经在列表里也没关系——会用这里的配置覆盖它（协议留空＝清掉原有指定与探测结果，回到自动）。</div>
         </div>
       </div>
@@ -483,7 +525,8 @@
     <div class="box" style="margin-bottom:10px">
       <div class="h">已有 key<span class="line"></span></div>
       <div class="b" style="padding:0 6px 6px"><div class="tblwrap"><table id="tbl_keys"></table></div></div>
-      <div class="hint" style="padding:0 10px 10px">「显示 / 复制」只在看板域名（已登录）或本机可用；key 值不会随统计快照下发，需要时才单独取。</div>
+      <div class="hint" style="padding:0 10px 10px">「显示 / 复制」只在看板域名（已登录）或本机可用；key 值不会随统计快照下发，需要时才单独取。<br>
+        「可用模型」＝ 这个 key 能访问哪些模型（默认全部）。限定后，该 key 拉 <code>/v1/models</code> 只看到自己那几个，请求没在名单里的模型直接 403 <code>model_not_allowed</code>，连单模型探活也是 404。</div>
     </div>
     <div class="box">
       <div class="h">新建 key<span class="line"></span></div>
@@ -491,9 +534,30 @@
         <div class="field" style="max-width:420px"><label>名称（例如 codex / claude-code / st）</label><input id="k_name" placeholder="codex"></div>
         <button class="act" id="k_submit">生成</button>
         <div id="k_out" class="hint" style="margin-top:12px"></div>
+        <div class="hint" style="margin-top:8px">新建的 key 默认可用全部模型，生成后在表格里点「可用模型」再限制。</div>
       </div>
     </div>
   </section>
+
+  <!-- 客户端 key 的模型白名单弹层 -->
+  <div id="kmod_ovl" class="ovl hidden">
+    <div class="ovlbox">
+      <div class="ovlh"><span id="kmod_title">可用模型</span><span class="line"></span><button class="act" id="kmod_x">关闭</button></div>
+      <div class="ovlb">
+        <div class="kmodbar">
+          <input id="kmod_q" placeholder="搜索模型…">
+          <button class="act" id="kmod_all">全选当前</button>
+          <button class="act" id="kmod_none">清空</button>
+          <span id="kmod_cnt" class="dim"></span>
+        </div>
+        <div id="kmod_list" class="kmodlist"></div>
+      </div>
+      <div class="ovlf">
+        <div class="hint" style="margin-right:auto">不勾任何模型＝全部可用（默认）。全选也按「全部」存，之后新加的模型自动可用。</div>
+        <button class="act" id="kmod_save">保存</button>
+      </div>
+    </div>
+  </div>
 
 </div>
 <div class="toast" id="toast"></div>
@@ -737,6 +801,8 @@ $('reload').onclick = () => { refreshStats(); loadConfig(true).then(() => {
 
 /* ---------- 用量统计：时间口径 ---------- */
 let RANGE = localStorage.getItem('gw_range') || 'all';
+let STACK_KEY = localStorage.getItem('gw_stack_key') || '';      // '' = 全部 key 聚合分色；否则只画该 key
+const SKEYS = ['--s1', '--s2', '--s3', '--s4', '--s5', '--s6', '--s7', '--s8'];
 const DAY = 86400e3;
 const RANGE_NAME = { '1h': '最近 1 小时', '5h': '最近 5 小时', '24h': '最近 24 小时', today: '今天', yesterday: '昨天', week: '本周', month: '本月', lastmonth: '上月', all: '全部', custom: '指定时间' };
 // 分桶口径：短区间按小时（今天/昨天要的是 24 根），按周及更长按日期
@@ -775,6 +841,7 @@ function rangeQuery() {
   if (w.since != null) p.push('since=' + w.since);
   if (w.until != null) p.push('until=' + w.until);
   if (RANGE_UNIT[RANGE]) p.push('unit=' + RANGE_UNIT[RANGE]);      // 指定按小时/按日期分桶
+  p.push('dim=key');                                               // 柱状图按客户端 key 分色
   return p.join('&');
 }
 function rangeInfoText(d) {
@@ -792,6 +859,11 @@ try {   // 恢复上次的自定义时间段
   const c = JSON.parse(localStorage.getItem('gw_range_custom') || 'null');
   if (c) { $('rng_from').value = c.from || ''; $('rng_to').value = c.to || ''; }
 } catch { }
+$('stack_key').onchange = () => {
+  STACK_KEY = $('stack_key').value;
+  localStorage.setItem('gw_stack_key', STACK_KEY);
+  refreshStats();
+};
 document.querySelectorAll('#rangebar .rbtn').forEach(b => b.onclick = () => {
   RANGE = b.dataset.rng; localStorage.setItem('gw_range', RANGE); syncRange(); refreshStats();
 });
@@ -837,7 +909,29 @@ async function refreshStats() {
 
   const ser = (d.series && d.series.length) ? d.series : (d.last24h || []);   // 兜底：旧版后端没有 series 时退回滚动 24 小时
   const isDay = d.bucket === 'day';
-  const max = Math.max(1, ...ser.map(x => x.in));
+  // 按客户端 key 分色：dim_names + 每桶 seg=[[名称下标,输入,输出,次数]]（旧版后端没有 → 退回单色总量）
+  const kn = d.dim_names || [];
+  const keyTot = new Array(kn.length).fill(0);
+  for (const b of ser) for (const s of (b.seg || [])) keyTot[s[0]] += s[1] || 0;
+  const keyOrder = kn.map((n, i) => ({ n, i, v: keyTot[i] })).sort((a, b) => b.v - a.v);   // 用量大的排前面（也决定配色顺序）
+  const keyColor = new Map(keyOrder.map((x, i) => [x.i, i < SKEYS.length ? `var(${SKEYS[i]})` : 'var(--sx)']));
+  const stacked = kn.length > 0;
+  if (stacked) {
+    if (STACK_KEY && !kn.includes(STACK_KEY)) { STACK_KEY = ''; localStorage.setItem('gw_stack_key', ''); }   // 该 key 在此口径下没数据
+    const sel = $('stack_key');
+    sel.innerHTML = `<option value="">全部 key（聚合 · 分色）</option>` +
+      keyOrder.map(x => `<option value="${esc(x.n)}">${esc(x.n)}（${fmt(x.v)}）</option>`).join('');
+    sel.value = STACK_KEY;
+    $('legend').innerHTML = keyOrder.map(x => `<span class="lg"><i style="background:${keyColor.get(x.i)}"></i>${esc(x.n)} <span class="dim">${fmt(x.v)}</span></span>`).join('');
+  } else {
+    $('legend').innerHTML = '';
+  }
+  $('stack_key').classList.toggle('hidden', !stacked);
+  const segsOf = (b) => (b.seg || []).filter(s => s[1] > 0).sort((a, b2) => b2[1] - a[1]);
+  const keyIx = stacked && STACK_KEY ? kn.indexOf(STACK_KEY) : -1;
+  const valOf = (b) => keyIx >= 0 ? ((b.seg || []).find(s => s[0] === keyIx) || [0, 0, 0, 0])[1]
+    : stacked ? segsOf(b).reduce((a, s) => a + s[1], 0) : b.in;      // 单 key 模式按该 key 自己的量画（纵轴自动缩放）
+  const max = Math.max(1, ...ser.map(valOf));
   const labAxis = (ts) => isDay
     ? new Date(ts).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
     : new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
@@ -845,11 +939,25 @@ async function refreshStats() {
     ? new Date(ts).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' })
     : new Date(ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false });
   $('chart_title').textContent = (isDay ? '每日' : '每小时') + '输入 tokens';
-  $('chart_sub').textContent = `${RANGE_NAME[RANGE] || ''} · 按${isDay ? '日' : '小时'} ${ser.length} 桶 · 按本地时间`.replace(/^ · /, '');
+  $('chart_sub').textContent = `${RANGE_NAME[RANGE] || ''} · 按${isDay ? '日' : '小时'} ${ser.length} 桶 · 按本地时间` +
+    (stacked ? (STACK_KEY ? ` · 仅 ${STACK_KEY}` : ' · 按 key 分色') : '');
   $('range_info').innerHTML = rangeInfoText(d);
   $('bar').style.gap = ser.length > 90 ? '1px' : '2px';
-  $('bar').innerHTML = ser.map(x =>
-    `<div class="col" style="height:${Math.max(2, x.in / max * 100)}%" title="${labTip(x.ts)}${isDay ? '' : ' 这一小时'}\n输入 ${fmt(x.in)} · 输出 ${fmt(x.out)} · ${x.requests} 次 · 命中 ${x.in ? (x.cached / x.in * 100).toFixed(0) : 0}%"></div>`).join('');
+  $('bar').innerHTML = ser.map(x => {
+    const segs = segsOf(x);
+    let inner;
+    if (keyIx >= 0) {
+      const s = (x.seg || []).find(v => v[0] === keyIx) || [keyIx, 0, 0, 0];
+      inner = `<div class="sg" style="height:100%;background:${keyColor.get(keyIx)}" title="${esc(STACK_KEY)}\n输入 ${fmt(s[1])} · 输出 ${fmt(s[2])} · ${fmt(s[3])} 次"></div>`;
+    } else if (stacked && segs.length) {
+      const tot = segs.reduce((a, s) => a + s[1], 0);
+      inner = segs.map(s => `<div class="sg" style="height:${s[1] / tot * 100}%;background:${keyColor.get(s[0])}" title="${esc(kn[s[0]])}\n输入 ${fmt(s[1])} · 输出 ${fmt(s[2])} · ${fmt(s[3])} 次"></div>`).join('');
+    } else {
+      inner = `<div class="sg solo" style="height:100%"></div>`;
+    }
+    const brk = (stacked && keyIx < 0 && segs.length > 1) ? '\n' + segs.map(s => `${kn[s[0]]} ${fmt(s[1])}`).join(' · ') : '';
+    return `<div class="col" style="height:${Math.max(2, valOf(x) / max * 100)}%" title="${labTip(x.ts)}${isDay ? '' : ' 这一小时'}\n输入 ${fmt(x.in)} · 输出 ${fmt(x.out)} · ${x.requests} 次 · 命中 ${x.in ? (x.cached / x.in * 100).toFixed(0) : 0}%${brk}">${inner}</div>`;
+  }).join('');
   const astep = Math.max(1, Math.ceil(ser.length / 6));
   $('axis').innerHTML = ser.filter((_, i) => i % astep === 0).map(x => `<span>${labAxis(x.ts)}</span>`).join('') || '<span>暂无数据</span>';
   $('h24s').textContent = `峰值 ${fmt(max)} tokens/${isDay ? '天' : 'h'}`;
@@ -877,8 +985,8 @@ async function refreshStats() {
 
 /* ---------- 最近请求：筛选 + 查询历史 ---------- */
 const REQ_HEAD = ['时间', 'IP', 'key', '模型', '状态', 'TTFT/总耗时', '入/出', '字节(↑请求 ↓响应)', '命中', '工具'];
-const PROTO_ABBR = { chat: 'chat', responses: 'resp', messages: 'msg' };
-const PROTO_FULL = { chat: 'chat — OpenAI Chat Completions', responses: 'responses — OpenAI Responses', messages: 'messages — Anthropic Messages' };
+const PROTO_ABBR = { chat: 'chat', responses: 'resp', messages: 'msg', gemini: 'gem' };
+const PROTO_FULL = { chat: 'chat — OpenAI Chat Completions', responses: 'responses — OpenAI Responses', messages: 'messages — Anthropic Messages', gemini: 'gemini — Google Generative Language' };
 // 入站协议：cproto 是实采的；旧记录（2026-10-11 前没有该字段）按 passthrough 推断——
 // 直通路的入站协议 == 上游协议，其余走的是 chat 入口。
 const inProto = (r) => r.cproto || (r.passthrough ? r.format : 'chat');
@@ -1001,6 +1109,26 @@ function fmtCell(m) {
       : m.auto ? ' <span class="pill" title="首次请求探测得到">自动</span>' : '');
 }
 
+const EFF_SRC = { manual: ['指定', '手工指定（模型级，压过供应商级与探测）'], provider: ['供应商', '来自供应商级默认档位'], probe: ['探测', '来自档位探测结果'] };
+function effCell(m) {
+  const e = m.effort || {};
+  const list = e.effective || [];
+  const src = e.manual ? EFF_SRC.manual : (e.manual_provider ? EFF_SRC.provider : (e.probed ? EFF_SRC.probe : null));
+  const chips = list.length
+    ? `<div class="effrow">${list.map(x => `<span class="eff" title="该模型上游接受的档位">${x}</span>`).join('')}</div>`
+    : '<span class="eff off" title="未探测/未指定：网关不干预，客户端发什么档位就原样透传">不干预</span>';
+  const btns = `<div class="effbtns">` +
+    `<button class="act" data-probe="${esc(m.id)}" title="逐个档位打最小请求，看上游接受哪些">探测</button> ` +
+    `<button class="act" data-set="${esc(m.id)}" title="手工指定档位（逗号分隔；留空＝清除）">指定</button>` +
+    (e.manual ? ` <button class="act" data-clr="${esc(m.id)}" title="清除手工指定，回落到供应商级/探测结果">清</button>` : '') +
+    `</div>`;
+  const meta = [];
+  if (src) meta.push(`<span class="pill" title="${src[1]}">${src[0]}</span>`);
+  if (e.manual_provider && e.manual) meta.push(`<span class="pill" title="供应商级默认档位（被模型级覆盖）">供应商 ${e.manual_provider.join('/')}</span>`);
+  if (e.at) meta.push(`<span class="dim" style="font-size:calc(var(--fs)*0.72)">${e.at.slice(0, 10)}</span>`);
+  const note = e.note ? `<div class="dim" style="font-size:calc(var(--fs)*0.72);white-space:normal;max-width:230px">${esc(e.note)}</div>` : '';
+  return chips + `<div style="margin-top:2px">${meta.join(' ')}</div>` + btns + note;
+}
 function renderModels() {
   if (!CONF) return;
   const q = ($('m_search').value || '').toLowerCase();
@@ -1010,19 +1138,79 @@ function renderModels() {
   $('m_filter').value = pf;
   const rows = CONF.models.filter(m => (!q || m.id.toLowerCase().includes(q) || String(m.provider || '').toLowerCase().includes(q) || String(m.format || '').includes(q))
     && (!pf || m.provider === pf));
+  SHOWN_MODELS = rows.map(m => m.id);
   $('m_count').textContent = `${rows.length} / ${CONF.models.length} 个`;
-  table($('tbl_models'), ['模型', '供应商', '协议', '请求', '输入', '输出', '命中', '操作'],
-    rows.map(m => [esc(m.id), esc(m.provider || '-'), fmtCell(m), fmt(m.requests), fmt(m.in), fmt(m.out),
+  table($('tbl_models'), ['模型', '供应商', '协议', '推理档位', '请求', '输入', '输出', '命中', '操作'],
+    rows.map(m => [esc(m.id), esc(m.provider || '-'), fmtCell(m), effCell(m), fmt(m.requests), fmt(m.in), fmt(m.out),
       m.in ? `<span class="${hitCls(m.cached / m.in * 100)}">${(m.cached / m.in * 100).toFixed(0)}%</span>` : '<span class="dim">—</span>',
-      `<button class="act danger" data-del="${esc(m.id)}">删除</button>`]), '没有匹配的模型', null, [0]);
+      `<button class="act danger" data-del="${esc(m.id)}">删除</button>`]), '没有匹配的模型', null, [0, 3]);
   document.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
     if (!confirm('从网关模型列表移除 ' + b.dataset.del + '？（不影响上游本身）')) return;
     try { const r = await api('/api/config/model/delete', { id: b.dataset.del }); CONF = r.config; toast('已移除 ' + b.dataset.del); renderModels(); }
     catch (e) { toast('失败：' + e.message, 1); }
   });
+  document.querySelectorAll('[data-probe]').forEach(b => b.onclick = async () => {
+    const id = b.dataset.probe;
+    b.disabled = true; const old = b.textContent; b.textContent = '探测中…';
+    try {
+      const r = await api('/api/probe/efforts', { id });
+      CONF = r.config;
+      const rej = Object.keys(r.rejected || {});
+      toast(`${id}：接受 ${r.levels.length} 档（${r.levels.join('/') || '无'}）` + (rej.length ? `；被拒 ${rej.join('/')}` : '') + (r.note ? ` —— ${r.note}` : ''));
+      renderModels();
+    } catch (e) { toast('探测失败：' + e.message, 1); b.disabled = false; b.textContent = old; }
+  });
+  document.querySelectorAll('[data-set]').forEach(b => b.onclick = async () => {
+    const id = b.dataset.set;
+    const m = CONF.models.find(x => x.id === id) || {};
+    const cur = ((m.effort || {}).manual || []).join(', ');
+    const v = prompt(`手工指定「${id}」可用的推理档位\n\n可用：${EFF_LADDER.join(' / ')}\n留空＝清除（回到供应商级/探测结果）\n\n当前手工指定：${cur || '（无）'}`, cur);
+    if (v === null) return;
+    try {
+      const r = await api('/api/config/model/efforts', { id, levels: v });
+      CONF = r.config;
+      toast(r.efforts ? `${id} 档位已指定：${r.efforts.join('/')}` : `${id} 手工指定已清除`);
+      renderModels();
+    } catch (e) { toast('失败：' + e.message, 1); }
+  });
+  document.querySelectorAll('[data-clr]').forEach(b => b.onclick = async () => {
+    try {
+      const r = await api('/api/config/model/efforts', { id: b.dataset.clr, levels: '' });
+      CONF = r.config; toast('已清除 ' + b.dataset.clr + ' 的手工指定'); renderModels();
+    } catch (e) { toast('失败：' + e.message, 1); }
+  });
 }
 $('m_search').oninput = renderModels;
 $('m_filter').onchange = renderModels;
+
+/* ---- 推理档位：批量探测 ---- */
+const EFF_LADDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+let SHOWN_MODELS = [];
+let PROBING = false;
+async function probeLoop(body, btn, label) {
+  if (PROBING) return toast('已经有一批探测在跑，等它结束', 1);
+  PROBING = true; btn.disabled = true;
+  let done = 0, failed = 0;
+  try {
+    for (let i = 0; i < 40; i++) {                       // 每次最多 5 个，最多 40 轮（＝200 个模型）
+      const r = await api('/api/probe/efforts/bulk', body);
+      CONF = r.config;
+      done += (r.results || []).filter(x => !x.error).length;
+      failed += (r.results || []).filter(x => x.error).length;
+      btn.textContent = `${label}：${done}${failed ? `（失败 ${failed}）` : ''}…`;
+      if (!r.remaining) break;
+    }
+    toast(`探测完成：成功 ${done} 个${failed ? `，失败 ${failed} 个` : ''}`);
+  } catch (e) { toast('批量探测失败：' + e.message, 1); }
+  finally { PROBING = false; btn.disabled = false; btn.textContent = label; renderModels(); }
+}
+$('m_probe_unprobed').onclick = () => probeLoop({ limit: 5, only_unprobed: true }, $('m_probe_unprobed'), '探测未探测的模型');
+$('m_probe_shown').onclick = () => {
+  const ids = SHOWN_MODELS.slice();
+  if (!ids.length) return toast('当前没有筛选出模型', 1);
+  if (!confirm(`重新探测当前筛选出的 ${ids.length} 个模型？\n\n每个模型会对上游发 7 个最小请求（会覆盖已有探测结果；手工指定的档位不受影响）。`)) return;
+  probeLoop({ ids, limit: 5, only_unprobed: false }, $('m_probe_shown'), '重探当前筛选');
+};
 
 /* 供应商列表：正式 / 测试 两组，各自可折叠（测试组默认折叠，状态存 localStorage） */
 const PV_HEAD = ['供应商', 'Base URL', '前缀', 'key', '模型数', '参与统计', '操作'];
@@ -1035,7 +1223,8 @@ function pvRow(p) {
   return [
     `${esc(p.name)}` +
     `<span class="pill ${p.test ? 't' : 'f'}" data-toggletest="${esc(p.name)}" title="点击切换：${p.test ? '当前＝测试供应商' : '当前＝正式供应商'}（${tip}）">${p.test ? '测试' : '正式'}</span>` +
-    (p.reasoning_echo ? ' <span class="pill" title="reasoning_echo：保思维链">回灌</span>' : ''),
+    (p.reasoning_echo ? ' <span class="pill" title="reasoning_echo：保思维链">回灌</span>' : '') +
+    (p.efforts && p.efforts.length ? ` <span class="pill" title="供应商级默认推理档位（模型级可覆盖）">档位 ${p.efforts.join('/')}</span>` : ''),
     `<span class="dim">${esc(p.base_url)}</span>`, esc(p.prefix || '-'),
     p.has_key ? '<span class="green">已设置</span>' : '<span class="red">未设置</span>',
     p.models,
@@ -1096,7 +1285,7 @@ function renderProviders() {
 let EDIT_NAME = null, UA_ORIG = '', HDR_ORIG = '';
 function resetProviderForm() {
   EDIT_NAME = null; UA_ORIG = ''; HDR_ORIG = '';
-  ['p_name', 'p_prefix', 'p_url', 'p_env', 'p_ua', 'p_hdr', 'p_key'].forEach(id => { $(id).value = ''; $(id).disabled = false; });
+  ['p_name', 'p_prefix', 'p_url', 'p_env', 'p_ua', 'p_hdr', 'p_key', 'p_efforts'].forEach(id => { $(id).value = ''; $(id).disabled = false; });
   $('p_echo').checked = false;
   $('p_test').checked = false;
   $('p_key').placeholder = 'sk-...';
@@ -1119,6 +1308,7 @@ async function startEditProvider(name) {
     $('p_ua').value = UA_ORIG;
     $('p_hdr').value = HDR_ORIG;
     $('p_echo').checked = !!d.reasoning_echo;
+    $('p_efforts').value = (d.efforts || []).join(', ');
     $('p_test').checked = !!d.test;
     $('p_title').textContent = '编辑供应商：' + d.name;
     $('p_submit').textContent = '保存修改';
@@ -1136,12 +1326,13 @@ $('p_submit').onclick = async () => {
   try {
     if (EDIT_NAME) {
       const ua = $('p_ua').value.trim();
-      if (!ua && UA_ORIG && !confirm(`清空「${EDIT_NAME}」的 User-Agent？\n\n部分上游（带 Cloudflare 前置的）会直接 403 error 1010，确认清空？`)) return;
+      if (!ua && UA_ORIG && !confirm(`清空「${EDIT_NAME}」的 User-Agent？\n\n部分上游（Cloudflare 前置等）会直接 403，确认清空？`)) return;
       if (!hdr && HDR_ORIG && !confirm(`清空「${EDIT_NAME}」的额外请求头？\n\n原值：${HDR_ORIG}\n确认清空？`)) return;
       const r = await api('/api/config/provider/update', {
         name: EDIT_NAME, base_url: $('p_url').value.trim(),
         api_key: $('p_key').value.trim(), api_key_env: $('p_env').value.trim(),
         user_agent: ua, extra_headers: extra || {}, reasoning_echo: $('p_echo').checked, test: $('p_test').checked,
+        efforts: $('p_efforts').value.trim(),
       });
       CONF = r.config;
       toast(`已更新 ${r.provider}：${(r.changed || []).join('、') || '无变化'}`);
@@ -1152,7 +1343,7 @@ $('p_submit').onclick = async () => {
       name: $('p_name').value.trim(), prefix: $('p_prefix').value.trim(), base_url: $('p_url').value.trim(),
       api_key: $('p_key').value.trim(), api_key_env: $('p_env').value.trim(),
       user_agent: $('p_ua').value.trim(), extra_headers: extra, reasoning_echo: $('p_echo').checked,
-      test: $('p_test').checked,
+      test: $('p_test').checked, efforts: $('p_efforts').value.trim(),
     });
     CONF = r.config;
     resetProviderForm();
@@ -1223,7 +1414,7 @@ $('mm_bulkadd').onclick = async () => {
   const ids = selIds();
   if (!ids.length) return toast('没有勾选模型', 1);
   try {
-    const r = await api('/api/config/models/bulk', { prefix: FETCH_PREFIX || mmPrefix(), ids, format: $('mm_bulkfmt').value });
+    const r = await api('/api/config/models/bulk', { prefix: FETCH_PREFIX || mmPrefix(), ids, format: $('mm_bulkfmt').value, efforts: $('mm_bulk_efforts').value.trim() });
     CONF = r.config;
     toast(`已添加 ${r.added} 个${r.updated ? `、覆盖 ${r.updated} 个` : ''}，列表共 ${r.total} 个`);
     await doFetch();
@@ -1238,12 +1429,12 @@ $('mm_submit').onclick = async () => {
   if (!id) return toast('先填模型 ID', 1);
   if (!prefix) return toast('先选一个有前缀的供应商', 1);
   try {
-    const r = await api('/api/config/model', { prefix, id, format: $('mm_fmt').value });
+    const r = await api('/api/config/model', { prefix, id, format: $('mm_fmt').value, efforts: $('mm_efforts').value.trim() });
     CONF = r.config;
     toast(r.existed
       ? `已覆盖 ${r.model}：协议 ${fmtName(r.prev_format)} → ${fmtName(r.format)}`
       : `已添加 ${r.model}（协议 ${fmtName(r.format)}）`);
-    $('mm_id').value = '';
+    $('mm_id').value = ''; $('mm_efforts').value = '';
     renderProviders();
   } catch (e) { toast('失败：' + e.message, 1); }
 };
@@ -1252,10 +1443,11 @@ async function renderKeys() {
   if (!CONF) return;
   let st = {};
   try { st = (await api('/api/stats')).by_key || {}; } catch { }
-  table($('tbl_keys'), ['key', 'key 值', '协议', '协议互转', '请求', '输入', '输出', '字节(↑/↓)', '命中', '操作'],
-    CONF.keys.map(k => { const v = st[k.name] || {};
+  table($('tbl_keys'), ['key', 'key 值', '可用模型', '协议', '协议互转', '请求', '输入', '输出', '字节(↑/↓)', '命中', '操作'],
+    CONF.keys.map(k => { const v = st[k.name] || {}; const lim = (k.models || []).length;
       return [esc(k.name),
         `<span data-keycell="${esc(k.name)}" class="dim" style="word-break:break-all">sk-gw-••••••••••••</span>`,
+        `<button class="act" data-kmods="${esc(k.name)}" title="点开选择这个 key 能访问哪些模型（默认全部）"${lim ? '' : ' style="opacity:.72"'}>${lim ? '仅 ' + lim + ' 个' : '全部（' + (CONF.models || []).length + '）'}</button>`,
         `<select data-kproto="${esc(k.name)}">` + ['', 'chat', 'responses', 'messages'].map(p =>
           `<option value="${p}"${(k.protocol || '') === p ? ' selected' : ''}>${p || '自动'}</option>`).join('') + '</select>',
         `<label title="协议互转（实验性，默认关）：允许该 key 的 responses / messages 客户端跨协议使用其它协议的模型（走 chat 中枢互转）。&#10;代价：互转会丢原生保真度——加密推理链、图片块会被丢，Anthropic 流式的 input_tokens 只能补在 message_delta。&#10;同协议请求不受影响（仍走原生直通）。" style="display:flex;gap:6px;align-items:center;justify-content:center;cursor:help"><input type="checkbox" data-kint="${esc(k.name)}" style="width:auto"${k.interop ? ' checked' : ''}><span class="dim" style="font-size:calc(var(--fs)*0.8)">${k.interop ? '开' : '关'}</span></label>`,
@@ -1263,6 +1455,7 @@ async function renderKeys() {
         `<button class="act" data-rev="${esc(k.name)}">显示</button> ` +
         `<button class="act" data-copy="${esc(k.name)}">复制</button> ` +
         `<button class="act danger" data-delk="${esc(k.name)}">删除</button>`]; }), '还没有 key', null, [1]);
+  document.querySelectorAll('[data-kmods]').forEach(b => b.onclick = () => openKeyModels(b.dataset.kmods));
   document.querySelectorAll('[data-kint]').forEach(c => c.onchange = async () => {
     try {
       const r = await api('/api/config/key/interop', { name: c.dataset.kint, enabled: c.checked });
@@ -1301,7 +1494,7 @@ async function renderKeys() {
   });
   document.querySelectorAll('[data-delk]').forEach(b => b.onclick = async () => {
     const name = b.dataset.delk;
-    if (!confirm(`删除客户端 key「${name}」？\n\n用这个 key 的客户端（各客户端）会立刻 401，需要换 key。\n配置会先自动备份。`)) return;
+    if (!confirm(`删除客户端 key「${name}」？\n\n用这个 key 的客户端（酒馆 / Codex / 脚本…）会立刻 401，需要换 key。\n配置会先自动备份。`)) return;
     try {
       const r = await api('/api/config/key/delete', { name });
       CONF = r.config;
@@ -1310,6 +1503,60 @@ async function renderKeys() {
     } catch (e) { toast('失败：' + e.message, 1); }
   });
 }
+/* ---------- 客户端 key 的可用模型（白名单）弹层 ---------- */
+let KMOD_KEY = null, KMOD_SEL = new Set();
+const kmodAll = () => (CONF.models || []).map(m => m.id);
+function kmodCount() {
+  const all = kmodAll().length;
+  $('kmod_cnt').textContent = `已选 ${KMOD_SEL.size} / ${all}${KMOD_SEL.size === 0 || KMOD_SEL.size >= all ? '（＝全部可用）' : ''}`;
+}
+function drawKeyModels() {
+  const q = $('kmod_q').value.trim().toLowerCase();
+  const list = kmodAll().filter(id => !q || id.toLowerCase().includes(q));
+  $('kmod_list').innerHTML = list.length
+    ? list.map(id => `<label title="${esc(id)}"><input type="checkbox" data-km="${esc(id)}"${KMOD_SEL.has(id) ? ' checked' : ''}><span>${esc(id)}</span></label>`).join('')
+    : '<div class="dim" style="padding:8px 4px">没有匹配的模型</div>';
+  document.querySelectorAll('[data-km]').forEach(c => c.onchange = () => {
+    if (c.checked) KMOD_SEL.add(c.dataset.km); else KMOD_SEL.delete(c.dataset.km);
+    kmodCount();
+  });
+  kmodCount();
+}
+function openKeyModels(name) {
+  const k = (CONF.keys || []).find(x => x.name === name);
+  if (!k) return;
+  KMOD_KEY = name;
+  KMOD_SEL = new Set(k.models || []);
+  $('kmod_title').textContent = `key「${name}」可访问的模型`;
+  $('kmod_q').value = '';
+  drawKeyModels();
+  $('kmod_ovl').classList.remove('hidden');
+  $('kmod_q').focus();
+}
+function closeKeyModels() { $('kmod_ovl').classList.add('hidden'); KMOD_KEY = null; }
+$('kmod_x').onclick = closeKeyModels;
+$('kmod_ovl').onclick = (e) => { if (e.target === $('kmod_ovl')) closeKeyModels(); };
+$('kmod_q').oninput = drawKeyModels;
+$('kmod_all').onclick = () => {            // 全选＝当前搜索结果（搜索框为空时就是全部）
+  const q = $('kmod_q').value.trim().toLowerCase();
+  kmodAll().filter(id => !q || id.toLowerCase().includes(q)).forEach(id => KMOD_SEL.add(id));
+  drawKeyModels();
+};
+$('kmod_none').onclick = () => { KMOD_SEL.clear(); drawKeyModels(); };
+$('kmod_save').onclick = async () => {
+  if (!KMOD_KEY) return;
+  const all = kmodAll();
+  // 勾满（或一个不勾）＝存空数组＝全部可用：以后新加的模型自动可用，不会意外把新模型挡在外面
+  const models = (KMOD_SEL.size === 0 || KMOD_SEL.size >= all.length) ? [] : all.filter(id => KMOD_SEL.has(id));
+  try {
+    const r = await api('/api/config/key/models', { name: KMOD_KEY, models });
+    CONF = r.config;
+    toast(r.models.length ? `key ${r.key} 现在只能用 ${r.models.length} 个模型` : `key ${r.key} 恢复为全部模型可用`);
+    closeKeyModels();
+    renderKeys();
+  } catch (e) { toast('保存失败：' + e.message, 1); }
+};
+
 $('k_submit').onclick = async () => {
   try {
     const r = await api('/api/config/key', { name: $('k_name').value.trim() });
@@ -1321,7 +1568,7 @@ $('k_submit').onclick = async () => {
   } catch (e) { toast('失败：' + e.message, 1); }
 };
 
-/* ---------- 上游额度：上游余额 + 用量估算 ---------- */
+/* ---------- 上游额度：余额 + 用量（按 config.quota 配置） ---------- */
 const usd = (n) => '$' + Number(n || 0).toFixed(n >= 1 ? 2 : 4);
 const pctCls = (p) => p >= 80 ? 'red' : p >= 50 ? 'amber' : 'green';
 const resetAt = (iso) => iso ? new Date(iso).toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '-';
@@ -1339,22 +1586,72 @@ async function renderQuota(force) {
       ? `${qItem('5小时', q.rolling)} &nbsp;·&nbsp; ${qItem('本周', q.weekly)} &nbsp;·&nbsp; ${qItem('本月', q.monthly)}`
       : `<span class="red">读取失败</span> <span class="dim" style="font-size:calc(var(--fs)*0.78)">${esc(q.error || '')}</span>`;
     const rows = (go.models || []).filter(m => m.d30 > 0 || m.h5 > 0);
+    // ---- 订阅周期（月付，锚点＝官方下次续费时刻）----
+    const nowMs = Date.now();
+    const cs = go.cycle_stats || null;
+    const cyc = ((cs && cs.cycles) || []).filter(x => x.reqs > 0 || (nowMs >= x.start && nowMs < x.end));
+    const d2 = (ms) => new Date(ms).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit' });
+    const tok = (n) => { n = Number(n || 0); return n >= 1e9 ? (n / 1e9).toFixed(2) + 'B' : n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(0) + 'K' : String(n); };
+    const cycleBox = (() => {
+      if (!cs || !cyc.length) return '';
+      const cur = cyc.find(x => nowMs >= x.start && nowMs < x.end);
+      const daysLeft = cur ? Math.max(0, Math.ceil((cur.end - nowMs) / 86400e3)) : null;
+      const mq = q.monthly;
+      return `<div class="dim" style="font-size:calc(var(--fs)*0.85);margin-top:10px;border-top:1px dashed rgba(255,255,255,.14);padding-top:8px">
+          订阅周期 · 归一化额度按 $${cs.base} 一档计 · 下次续费 <b>${resetAt(new Date(cs.anchor).toISOString())}</b>
+          ${daysLeft != null ? `· 剩 <span class="cyan">${daysLeft} 天</span>` : ''}
+          ${mq ? `· 官方本期 <span class="${pctCls(mq.percent)}">${mq.percent}%</span>（≈ $${(mq.percent / 100 * cs.base).toFixed(2)} / $${cs.base}）` : ''}
+        </div><div class="tblwrap" style="margin-top:6px"><table id="tbl_cycle"></table></div>`;
+    })();
     $('quota').innerHTML = `<div class="grid2" style="margin-bottom:8px">
         <div><div class="dim" style="font-size:calc(var(--fs)*0.85)">上游余额</div>
           <div style="font-size:calc(var(--fs)*1.45)">${dsCell}</div></div>
         <div><div class="dim" style="font-size:calc(var(--fs)*0.85)">上游额度（已用 / 各窗口独立重置）</div>
           <div style="font-size:calc(var(--fs)*1.45)">${goCell}</div></div>
       </div>
+      ${cycleBox}
       <div class="dim" style="font-size:calc(var(--fs)*0.85)">网关侧明细：5 小时 <span class="amber">${usd(w.h5)}</span> · 本周 <span class="amber">${usd(w.w7)}</span> · 30 天 <span class="amber">${usd(w.d30)}</span>
         <span style="font-size:calc(var(--fs)*0.78)">（${rq.h5 || 0} / ${rq.w7 || 0} / ${rq.d30 || 0} 次）</span></div>`
       + (rows.length ? '<div class="tblwrap" style="margin-top:6px"><table id="tbl_quota"></table></div>' : '')
-      + `<div class="hint" style="margin-top:6px">${esc(go.detail_note || '')}</div>`;
+      + `<div class="hint" style="margin-top:6px">${esc(go.detail_note || '')}；订阅周期按上游续费锚点切分，官方百分比含其它设备直连上游的用量；* 含价格表未收录的模型（只按已计价部分折算）</div>`;
     if (rows.length) {
       table($('tbl_quota'), ['模型', '5 小时', '本周', '30 天', '月上限', '月占比'],
         rows.map(m => [esc(m.model), usd(m.h5), usd(m.w7), usd(m.d30),
           m.cap ? '$' + m.cap : (/-free$/.test(m.model) ? '<span class="green">免费</span>' : '<span class="dim">未计价</span>'),
           m.cap ? `<span class="${hitCls(m.d30 / m.cap * 100)}">${(m.d30 / m.cap * 100).toFixed(1)}%</span>` : '—']),
         '暂无', null, [0], 22);
+    }
+    if (cyc.length) {
+      table($('tbl_cycle'), ['订阅周期', '请求', '输入 / 命中缓存 / 输出', '已产生费用', '占限额'],
+        cyc.map(x => {
+          const on = nowMs >= x.start && nowMs < x.end;
+          return [
+            `${d2(x.start)} → ${d2(x.end)}${on ? ' <span class="cyan">进行中</span>' : ''}`,
+            String(x.reqs),
+            `${tok(Math.max(0, x.in - x.cached))} / ${tok(x.cached)} / ${tok(x.out)}`,
+            (x.unpriced ? '<span class="dim" title="含价格表未收录的模型，只计请求数">' : '') + usd(x.cost) + (x.unpriced ? '*</span>' : ''),
+            `<span class="${hitCls(x.pct)}">${x.pct.toFixed(2)}%</span>`,
+          ];
+        }), '暂无数据', cyc.map(x => [x.end, x.reqs, x.in + x.out, x.cost, x.allow]), null, [0], 26);
+      const curCycle = cyc.find(x => nowMs >= x.start && nowMs < x.end);
+      const cm = (curCycle && curCycle.models) || [];
+      if (cm.length) {
+        const host = $('tbl_cycle') && $('tbl_cycle').parentElement;
+        const html = `<div class="dim" style="font-size:calc(var(--fs)*0.8);margin-top:8px">本周期按模型<span style="font-size:calc(var(--fs)*0.75)">（输入＝未命中缓存部分；占比＝该模型自身月限额）</span></div>
+           <div class="tblwrap" style="margin-top:4px"><table id="tbl_cycle_model"></table></div>`;
+        if (host) host.insertAdjacentHTML('afterend', html); else $('quota').insertAdjacentHTML('beforeend', html);
+        table($('tbl_cycle_model'), ['模型', '输入', '命中缓存', '输出', '已产生费用', '占该模型限额'],
+          cm.map(m => [
+            esc(m.model),
+            tok(Math.max(0, m.in - m.cached)),
+            tok(m.cached),
+            tok(m.out),
+            usd(m.cost),
+            m.pct == null
+              ? '<span class="green">免费</span>'
+              : `<span class="${hitCls(m.pct)}">${m.pct.toFixed(2)}%</span><span class="dim" style="font-size:calc(var(--fs)*0.75)"> /$${m.cap}</span>`,
+          ]), '暂无', cm.map(m => [m.model, m.in, m.cached, m.out, m.cost, m.pct || 0]), null, [0], 24);
+      }
     }
     $('q_at').textContent = '更新于 ' + new Date(d.ts).toLocaleTimeString('zh-CN', { hour12: false });
   } catch (e) { $('quota').innerHTML = `<span class="red">读取失败：${esc(e.message)}</span>`; }
