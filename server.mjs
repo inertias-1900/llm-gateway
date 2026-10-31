@@ -2,7 +2,7 @@
 /**
  * 网关核心：对客户端暴露 OpenAI Chat Completions，按模型路由到不同上游/不同协议。
  * - 上游 formats: "chat" = 原样透传 /chat/completions；"responses" = 翻译成 /v1/responses 再翻回来
- * - 鉴权：虚拟 key（Bearer 或 x-api-key），每个 key 可绑定一个稳定的上游 session 头
+ * - 鉴权：虚拟 key（Bearer 或 x-api-key），每个 key 绑定一个稳定的 x-upstream-session
  * - 统计：每条请求落 stats/requests-YYYY-MM-DD.jsonl（按天分文件），超过 3 天的自动 gzip
  */
 import http from 'node:http';
@@ -79,6 +79,134 @@ function readStatFile(name, tailOnly) {
 
 const jdump = (o) => JSON.stringify(o);
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+// ---------------- 面板用户 / 会话（分用户鉴权） ----------------
+// 账号存 config.users；管理员账号可以从 dashboard_auth 迁移（虚拟用户，不写盘）。
+// 归属规则：providers[].owner / keys[].owner 缺省＝管理员所有（旧配置行为不变）。
+const STATE_DIR = path.join(ROOT, 'state');
+fs.mkdirSync(STATE_DIR, { recursive: true });
+const SESSION_PATH = path.join(STATE_DIR, 'sessions.json');
+const SESSION_TTL_MS = 7 * 24 * 3600e3;
+const USER_RE = /^[a-z0-9][a-z0-9_.-]{1,31}$/i;
+function hashPw(salt, pw) { return crypto.createHash('sha256').update(String(salt || '') + String(pw || '')).digest('hex'); }
+function pwEq(a, b) {
+    const x = Buffer.from(String(a || ''), 'utf8'), y = Buffer.from(String(b || ''), 'utf8');
+    return x.length === y.length && x.length > 0 && crypto.timingSafeEqual(x, y);
+}
+function panelUser(name) {
+    const n = String(name || '').trim();
+    if (!n) return null;
+    const u = (CFG.users || {})[n];
+    if (u && u.password_sha256) {
+        return { name: n, role: u.role === 'admin' ? 'admin' : 'user', salt: u.salt || '', password_sha256: u.password_sha256, created_at: u.created_at || 0 };
+    }
+    const da = CFG.dashboard_auth || {};
+    if (da.username === n && da.password_sha256) {
+        return { name: n, role: 'admin', salt: da.salt || '', password_sha256: da.password_sha256, created_at: 0, virtual: true };
+    }
+    return null;
+}
+function userPools(name) {                        // 该用户名下供应商所在的组
+    const out = [];
+    for (const [pn, p] of Object.entries(CFG.pools || {})) {
+        if ((poolMembers(p) || []).some((m) => (((CFG.providers || {})[m.provider] || {}).owner === name))) out.push(pn);
+    }
+    return out;
+}
+function joinablePools() {
+    return Object.entries(CFG.pools || {}).filter(([, p]) => p && p.user_join === true).map(([n]) => n);
+}
+function panelUserList() {
+    const names = new Set([...Object.keys(CFG.users || {}), String((CFG.dashboard_auth || {}).username || '')].filter(Boolean));
+    return [...names].sort().map((n) => {
+        const u = panelUser(n) || {};
+        return {
+            name: n, role: u.role || 'user', created_at: u.created_at || 0, virtual: !!u.virtual,
+            providers: Object.entries(CFG.providers || {}).filter(([, p]) => p && p.owner === n).map(([x]) => x),
+            keys: (CFG.keys || []).filter((k) => k.owner === n).map((k) => k.name),
+            pools: userPools(n),
+        };
+    });
+}
+// 会话：内存 + state/sessions.json（重启不掉线）
+let SESSIONS = {};
+try { SESSIONS = JSON.parse(fs.readFileSync(SESSION_PATH, 'utf8')) || {}; } catch { SESSIONS = {}; }
+function saveSessions() {
+    try {
+        const tmp = SESSION_PATH + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(SESSIONS));
+        try { fs.chmodSync(tmp, 0o600); } catch { }
+        fs.renameSync(tmp, SESSION_PATH);
+    } catch (e) { log('session save failed', e.message); }
+}
+function pruneSessions() {
+    const now = Date.now(); let n = 0;
+    for (const [t, s] of Object.entries(SESSIONS)) if (!s || !s.exp || s.exp <= now) { delete SESSIONS[t]; n++; }
+    if (n) saveSessions();
+}
+pruneSessions();
+function newSession(name) {
+    const token = crypto.randomBytes(32).toString('base64url');
+    SESSIONS[token] = { u: name, exp: Date.now() + SESSION_TTL_MS };
+    pruneSessions(); saveSessions();
+    return token;
+}
+function sessionUser(req) {
+    const t = String(req.headers['x-gw-token'] || '').trim();
+    if (!t) return null;
+    const s = SESSIONS[t];
+    if (!s) return null;
+    if (!s.exp || s.exp <= Date.now()) { delete SESSIONS[t]; saveSessions(); return null; }
+    const u = panelUser(s.u);
+    if (!u) { delete SESSIONS[t]; saveSessions(); return null; }
+    return { ...u, token: t };
+}
+const LOGIN_FAILS = new Map();                    // ip -> { n, until }
+function loginBlocked(ip) {
+    const f = LOGIN_FAILS.get(ip);
+    if (!f) return false;
+    if (f.until && f.until <= Date.now()) { LOGIN_FAILS.delete(ip); return false; }
+    return f.n >= 8;
+}
+function loginFailed(ip) {
+    const f = LOGIN_FAILS.get(ip) || { n: 0, until: 0 };
+    f.n += 1;
+    if (f.n >= 8) f.until = Date.now() + 10 * 60e3;
+    LOGIN_FAILS.set(ip, f);
+    if (LOGIN_FAILS.size > 500) LOGIN_FAILS.clear();
+}
+// 老的无归属网关 key 仍可用于面板，但只限「本机直连」（无 CF 转发头 + 本机 Host）。
+// 远程拿一个分享出去的 key 不能读/写面板；远程一律走账号登录。
+function keyPanelAllowed(req) {
+    const h = req.headers || {};
+    if (h['cf-connecting-ip'] || h['x-forwarded-for']) return false;
+    const hn = String(h.host || '').split(':')[0];
+    return ['127.0.0.1', 'localhost', '::1', 'gateway'].includes(hn) || hn.startsWith('172.');
+}
+// 面板身份：Basic（管理员）、会话 token、或「无 owner 的旧网关 key」（仅本机直连，管理员兼容）。
+// 有 owner 的网关 key 只用于 /v1/*，不能读面板 API（否则用户生成的 key 能看全量配置）。
+function identityOf(req, dashOk) {
+    const da = CFG.dashboard_auth || {};
+    const adminId = (via) => {
+        const bu = panelUser(da.username || 'admin');
+        if (bu && bu.role !== 'admin') return null;        // Basic 账号被降权后不再给管理员权限
+        return { name: da.username || 'admin', role: 'admin', admin: true, via, panel: true };
+    };
+    if (dashOk) return adminId('basic');
+    const su = sessionUser(req);
+    if (su) return { name: su.name, role: su.role, admin: su.role === 'admin', via: 'session', panel: true, token: su.token };
+    const a = authenticate(req);
+    if (!a) return null;
+    const k = KEYS.get(a.key) || {};
+    const owner = k.owner ? String(k.owner) : '';
+    if (!owner) {
+        if (!keyPanelAllowed(req)) return null;
+        return adminId('key');
+    }
+    const u = panelUser(owner);
+    if (!u) return null;
+    return { name: u.name, role: u.role, admin: u.role === 'admin', via: 'key', panel: false, keyName: a.name };
+}
 // 兜底：handler 里的异常不能让整个网关退出（Node ≥15 未处理的 rejection 会直接退出）
 process.on('unhandledRejection', (e) => log('unhandledRejection:', (e && e.stack) || String(e)));
 process.on('uncaughtException', (e) => log('uncaughtException:', (e && e.stack) || String(e)));
@@ -158,13 +286,30 @@ CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 try {   // 迁移：加 cproto（客户端协议），便于排查「哪个协议来的请求」
     const cols = DB.prepare('PRAGMA table_info(requests)').all().map((c) => c.name);
     if (!cols.includes('cproto')) { DB.exec('ALTER TABLE requests ADD COLUMN cproto TEXT'); log('migrate: requests + cproto'); }
+    if (!cols.includes('pool')) { DB.exec('ALTER TABLE requests ADD COLUMN pool TEXT'); log('migrate: requests + pool'); }
 } catch (e) { log('migrate cproto fail', e.message); }
+try {   // 迁移：汇总表增加 pool 维度（上游组 / 直接转发分开统计）。老数据一律按「直接转发」归档
+    const rcols = DB.prepare('PRAGMA table_info(rollup_hour)').all().map((c) => c.name);
+    if (!rcols.includes('pool')) {
+        DB.exec(`CREATE TABLE rollup_hour_new(
+  hour INTEGER NOT NULL, model TEXT NOT NULL, provider TEXT NOT NULL, key TEXT NOT NULL, pool TEXT NOT NULL DEFAULT '',
+  requests INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0,
+  in_tok INTEGER DEFAULT 0, out_tok INTEGER DEFAULT 0, cached INTEGER DEFAULT 0, reasoning INTEGER DEFAULT 0,
+  ms INTEGER DEFAULT 0, ttft INTEGER DEFAULT 0, bytes_in INTEGER DEFAULT 0, bytes_out INTEGER DEFAULT 0, bytes_res INTEGER DEFAULT 0,
+  PRIMARY KEY(hour, model, provider, key, pool)) WITHOUT ROWID;
+INSERT INTO rollup_hour_new(hour,model,provider,key,pool,requests,errors,in_tok,out_tok,cached,reasoning,ms,ttft,bytes_in,bytes_out,bytes_res)
+ SELECT hour,model,provider,key,'',requests,errors,in_tok,out_tok,cached,reasoning,ms,ttft,bytes_in,bytes_out,bytes_res FROM rollup_hour;
+DROP TABLE rollup_hour;
+ALTER TABLE rollup_hour_new RENAME TO rollup_hour;`);
+        log('migrate: rollup_hour + pool');
+    }
+} catch (e) { log('migrate rollup pool fail', e.message); }
 const INS_REQ = DB.prepare(`INSERT INTO requests(ts,key,model,provider,upstream_model,format,status,ms,ttft_ms,stream,passthrough,ip,
- in_tok,out_tok,cached,reasoning,has_tool,reason_inj,req_bytes,res_bytes,up_res_bytes,usage_src,last_evt,error,conv,cproto)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-const INS_ROLL = DB.prepare(`INSERT INTO rollup_hour(hour,model,provider,key,requests,errors,in_tok,out_tok,cached,reasoning,ms,ttft,bytes_in,bytes_out,bytes_res)
- VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
- ON CONFLICT(hour,model,provider,key) DO UPDATE SET
+ in_tok,out_tok,cached,reasoning,has_tool,reason_inj,req_bytes,res_bytes,up_res_bytes,usage_src,last_evt,error,conv,cproto,pool)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+const INS_ROLL = DB.prepare(`INSERT INTO rollup_hour(hour,model,provider,key,pool,requests,errors,in_tok,out_tok,cached,reasoning,ms,ttft,bytes_in,bytes_out,bytes_res)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ ON CONFLICT(hour,model,provider,key,pool) DO UPDATE SET
   requests=requests+excluded.requests, errors=errors+excluded.errors, in_tok=in_tok+excluded.in_tok,
   out_tok=out_tok+excluded.out_tok, cached=cached+excluded.cached, reasoning=reasoning+excluded.reasoning,
   ms=ms+excluded.ms, ttft=ttft+excluded.ttft, bytes_in=bytes_in+excluded.bytes_in,
@@ -175,8 +320,8 @@ function dbInsert(r) {                     // 落库：明细表 + 小时汇总�
         st, num(r.ms), r.ttft_ms ?? null, r.stream ? 1 : 0, r.passthrough ? 1 : 0, r.ip ?? null,
         num(u.in), num(u.out), num(u.cached), num(u.reasoning), r.has_tool ? 1 : 0, num(r.reason_inj),
         num(r.req_bytes), num(r.res_bytes), num(r.up_res_bytes),
-        r.usage_src ?? null, r.last_evt ?? null, r.error ?? null, r.conv ?? null, r.cproto ?? null);
-    INS_ROLL.run(Math.floor(ts / HOUR) * HOUR, modelKey(r.model), providerKey(r.provider), keyKey(r.key),
+        r.usage_src ?? null, r.last_evt ?? null, r.error ?? null, r.conv ?? null, r.cproto ?? null, r.pool || null);
+    INS_ROLL.run(Math.floor(ts / HOUR) * HOUR, modelKey(r.model), providerKey(r.provider), keyKey(r.key), String(r.pool || ''),
         1, st >= 400 ? 1 : 0, num(u.in), num(u.out), num(u.cached), num(u.reasoning),
         num(r.ms), num(r.ttft_ms), num(r.req_bytes), num(r.up_res_bytes), num(r.res_bytes));
 }
@@ -319,16 +464,23 @@ function rowToRecord(x) {                   // SQL 行 → 前端用的记录形
         up_res_bytes: x.up_res_bytes, usage_src: x.usage_src, last_evt: x.last_evt, error: x.error, conv: x.conv, cproto: x.cproto,
     };
 }
-function reqOptions() {                    // 筛选下拉的可选项：直接从库里取 DISTINCT
-    const opt = (col) => DB.prepare(`SELECT DISTINCT ${col} v FROM requests WHERE ${col} IS NOT NULL AND ${col} <> '' ORDER BY v`).all().map((x) => x.v);
+function reqOptions(who) {                    // 筛选下拉的可选项：直接从库里取 DISTINCT（普通用户只看自己 key 的）
+    const own = who && !who.admin ? (CFG.keys || []).filter((k) => k.owner === who.name).map((k) => k.name) : null;
+    const kf = keyCondSql(own), kArgs = own || [];
+    const opt = (col) => DB.prepare(`SELECT DISTINCT ${col} v FROM requests WHERE ${col} IS NOT NULL AND ${col} <> ''${kf} ORDER BY v`).all(...kArgs).map((x) => x.v);
     return {
-        models: opt('model'), keys: opt('key'), ips: opt('ip'),
-        statuses: DB.prepare('SELECT DISTINCT status s FROM requests WHERE status IS NOT NULL ORDER BY s').all().map((x) => x.s),
+        models: opt('model'), keys: own || opt('key'), ips: opt('ip'),
+        statuses: DB.prepare(`SELECT DISTINCT status s FROM requests WHERE status IS NOT NULL${kf} ORDER BY s`).all(...kArgs).map((x) => x.s),
     };
 }
-function queryRequests(q) {
+function queryRequests(q, who) {
     const f = parseReqQuery(q || {});
     const where = [], args = [];
+    if (who && !who.admin) {                  // 普通用户：只能查自己名下 key 的请求
+        const own = (CFG.keys || []).filter((k) => k.owner === who.name).map((k) => k.name);
+        if (!own.length) where.push('1 = 0');
+        else { where.push(`key IN (${own.map(() => '?').join(',')})`); args.push(...own); }
+    }
     if (f.model) { where.push('LOWER(model) LIKE ?'); args.push('%' + f.model + '%'); }
     if (f.key) { where.push('key = ?'); args.push(f.key); }
     if (f.ip) { where.push('ip LIKE ?'); args.push('%' + f.ip + '%'); }
@@ -342,7 +494,7 @@ function queryRequests(q) {
     const items = DB.prepare('SELECT * FROM requests' + W + ' ORDER BY ts DESC LIMIT ? OFFSET ?').all(...args, f.limit, f.offset).map(rowToRecord);
     return {
         total, shown: items.length, scanned: total, source: 'db', truncated: false, offset: f.offset, limit: f.limit, items,
-        options: reqOptions(),
+        options: reqOptions(who),
     };
 }
 
@@ -399,17 +551,22 @@ function mergeIntoSeries(list, map, step) {                    // 把聚合结�
     return list;
 }
 // 区间聚合：整小时段读 rollup_hour，两端不足一小时的部分读明细表 —— 与逐条扫描结果完全一致
-const ROLL_SQL = `SELECT model, provider, key, SUM(requests) n, SUM(errors) e, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c,
+// 口径：pool＝走上游组的请求；direct＝没有组、网关直连供应商的请求（历史数据都在 direct 里）
+const MODE_COND = (mode) => (mode === 'all' ? `1=1` : mode === 'direct' ? `COALESCE(pool,'') = ''` : `COALESCE(pool,'') <> ''`);
+// 分用户口径：只统计该用户名下 key 的记录（普通用户看板用）。
+// null/undefined＝不过滤（管理员）；空数组＝该用户还没有 key，必须 1=0（不能退化成全量）。
+const keyCondSql = (keys) => (keys == null ? '' : (keys.length ? ` AND key IN (${keys.map(() => '?').join(',')})` : ' AND 1=0'));
+const ROLL_SQL = (m, kf = '') => `SELECT model, provider, key, SUM(requests) n, SUM(errors) e, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c,
   SUM(reasoning) rz, SUM(ms) m, SUM(ttft) t, SUM(bytes_in) bi, SUM(bytes_out) bo, SUM(bytes_res) br
-  FROM rollup_hour WHERE hour >= ? AND hour < ? GROUP BY model, provider, key`;
-const RAW_SQL = `SELECT COALESCE(NULLIF(model,''), '${MODEL_UNKNOWN}') model, COALESCE(NULLIF(provider,''), '(未路由)') provider,
+  FROM rollup_hour WHERE hour >= ? AND hour < ? AND ${MODE_COND(m)}${kf} GROUP BY model, provider, key`;
+const RAW_SQL = (m, kf = '') => `SELECT COALESCE(NULLIF(model,''), '${MODEL_UNKNOWN}') model, COALESCE(NULLIF(provider,''), '(未路由)') provider,
   COALESCE(NULLIF(key,''), '(未知)') key, COUNT(*) n, SUM(status >= 400) e, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c,
   SUM(reasoning) rz, SUM(ms) m, SUM(ttft_ms) t, SUM(req_bytes) bi, SUM(up_res_bytes) bo, SUM(res_bytes) br
-  FROM requests WHERE ts >= ? AND ts < ? GROUP BY 1, 2, 3`;
-const ROLL_SERIES = `SELECT hour h, SUM(requests) n, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c, SUM(reasoning) rz
-  FROM rollup_hour WHERE hour >= ? AND hour < ? GROUP BY hour`;
-const RAW_SERIES = `SELECT (ts/3600000)*3600000 h, COUNT(*) n, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c, SUM(reasoning) rz
-  FROM requests WHERE ts >= ? AND ts < ? GROUP BY h`;
+  FROM requests WHERE ts >= ? AND ts < ? AND ${MODE_COND(m)}${kf} GROUP BY 1, 2, 3`;
+const ROLL_SERIES = (m, kf = '') => `SELECT hour h, SUM(requests) n, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c, SUM(reasoning) rz
+  FROM rollup_hour WHERE hour >= ? AND hour < ? AND ${MODE_COND(m)}${kf} GROUP BY hour`;
+const RAW_SERIES = (m, kf = '') => `SELECT (ts/3600000)*3600000 h, COUNT(*) n, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c, SUM(reasoning) rz
+  FROM requests WHERE ts >= ? AND ts < ? AND ${MODE_COND(m)}${kf} GROUP BY h`;
 // 按去向分色的序列（?dim=model|provider|key）：每桶再按该维度拆开，供看板堆叠柱状图着色。
 // 只做「已选中的那一维」，避免一次吐三个维度的数据把响应撑大。
 const DIM_EXPR = {
@@ -417,10 +574,16 @@ const DIM_EXPR = {
     provider: `COALESCE(NULLIF(provider,''), '(未路由)')`,
     key: `COALESCE(NULLIF(key,''), '(未知)')`,
 };
-const ROLL_SERIES_DIM = (d) => `SELECT hour h, ${DIM_EXPR[d]} k, SUM(requests) n, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c, SUM(reasoning) rz
-  FROM rollup_hour WHERE hour >= ? AND hour < ? GROUP BY h, k`;
-const RAW_SERIES_DIM = (d) => `SELECT (ts/3600000)*3600000 h, ${DIM_EXPR[d]} k, COUNT(*) n, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c, SUM(reasoning) rz
-  FROM requests WHERE ts >= ? AND ts < ? GROUP BY h, k`;
+const ROLL_SERIES_DIM = (d, m, kf = '') => `SELECT hour h, ${DIM_EXPR[d]} k, SUM(requests) n, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c, SUM(reasoning) rz
+  FROM rollup_hour WHERE hour >= ? AND hour < ? AND ${MODE_COND(m)}${kf} GROUP BY h, k`;
+const RAW_SERIES_DIM = (d, m, kf = '') => `SELECT (ts/3600000)*3600000 h, ${DIM_EXPR[d]} k, COUNT(*) n, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c, SUM(reasoning) rz
+  FROM requests WHERE ts >= ? AND ts < ? AND ${MODE_COND(m)}${kf} GROUP BY h, k`;
+// key × 模型 交叉表：用来回答「某个 key 到底在用什么模型」
+const ROLL_PAIR = (m, kf = '') => `SELECT key, model, SUM(requests) n, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c
+  FROM rollup_hour WHERE hour >= ? AND hour < ? AND ${MODE_COND(m)}${kf} GROUP BY key, model`;
+const RAW_PAIR = (m, kf = '') => `SELECT COALESCE(NULLIF(key,''),'(未知)') key, COALESCE(NULLIF(model,''),'${MODEL_UNKNOWN}') model,
+  COUNT(*) n, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c
+  FROM requests WHERE ts >= ? AND ts < ? AND ${MODE_COND(m)}${kf} GROUP BY 1, 2`;
 function sqlAgg(sql, args) {
     return DB.prepare(sql).all(...args).map((x) => ({
         model: x.model, provider: x.provider, key: x.key,
@@ -442,7 +605,9 @@ function segments(s, e) {                   // 整小时段走汇总表，两端
     if (lastHour < e) segs.push({ raw: true, from: lastHour, to: e });
     return segs;
 }
-function rangeAgg(since, until, tzMin, unitHint, dim) {
+function rangeAgg(since, until, tzMin, unitHint, dim, mode, keys) {
+    const mm = mode === 'all' ? 'all' : mode === 'direct' ? 'direct' : 'pool';
+    const kf = keyCondSql(keys), kArgs = Array.isArray(keys) && keys.length ? keys : [];
     const tzMs = (Number.isFinite(tzMin) ? tzMin : TZ_DEFAULT_MIN) * 60000;
     const sinceTs = Number.isFinite(since) && since > 0 ? since : 0;
     const untilTs = Number.isFinite(until) && until > 0 ? until : Date.now();
@@ -451,12 +616,13 @@ function rangeAgg(since, until, tzMin, unitHint, dim) {
     const firstTs = sinceTs || (DB.prepare('SELECT MIN(ts) m FROM requests').get().m || untilTs - HOUR);
     const b = pickBucket(Math.max(untilTs - firstTs, HOUR), unitHint);
     const totals = emptyTotals(), byModel = {}, byProvider = {}, byKey = {}, series = new Map();
+    const byPair = {};                                               // key -> model -> 聚合
     let errors = 0, matched = 0, segs = 0;
     const segList = segments(sinceTs, untilTs);
     segs = segList.length;
     const dimNames = [], dimIdx = new Map(), dimSeries = new Map();   // ?dim= 分色：桶 -> 维度 -> 数值
     for (const seg of segList) {
-        for (const v of sqlAgg(seg.raw ? RAW_SQL : ROLL_SQL, [seg.from, seg.to])) {
+        for (const v of sqlAgg((seg.raw ? RAW_SQL : ROLL_SQL)(mm, kf), [seg.from, seg.to, ...kArgs])) {
             matched += v.requests; errors += v.errors;
             totals.requests += v.requests; totals.in += v.in; totals.out += v.out; totals.cached += v.cached;
             totals.reasoning += v.reasoning; totals.ms += v.ms; totals.ttft += v.ttft;
@@ -465,16 +631,22 @@ function rangeAgg(since, until, tzMin, unitHint, dim) {
             addRow(byProvider, v.provider || '(未路由)', v);
             addRow(byKey, v.key || '(未知)', v);
         }
-        for (const x of DB.prepare(seg.raw ? RAW_SERIES : ROLL_SERIES).all(seg.from, seg.to)) {
+        for (const x of DB.prepare((seg.raw ? RAW_SERIES : ROLL_SERIES)(mm, kf)).all(seg.from, seg.to, ...kArgs)) {
             const bk = bucketStart(x.h, b.step, tzMs);
             const cur = series.get(bk) || { ts: bk, requests: 0, in: 0, out: 0, cached: 0, reasoning: 0 };
             cur.requests += x.n || 0; cur.in += x.i || 0; cur.out += x.o || 0; cur.cached += x.c || 0; cur.reasoning += x.rz || 0;
             series.set(bk, cur);
         }
+        for (const x of DB.prepare((seg.raw ? RAW_PAIR : ROLL_PAIR)(mm, kf)).all(seg.from, seg.to, ...kArgs)) {
+            const k = x.key || '(未知)', m0 = x.model || MODEL_UNKNOWN;
+            const row = (byPair[k] || (byPair[k] = {}))[m0] || { requests: 0, in: 0, out: 0, cached: 0 };
+            row.requests += x.n || 0; row.in += x.i || 0; row.out += x.o || 0; row.cached += x.c || 0;
+            byPair[k][m0] = row;
+        }
     }
     if (dim) {
         for (const seg of segList) {
-            for (const x of DB.prepare(seg.raw ? RAW_SERIES_DIM(dim) : ROLL_SERIES_DIM(dim)).all(seg.from, seg.to)) {
+            for (const x of DB.prepare((seg.raw ? RAW_SERIES_DIM : ROLL_SERIES_DIM)(dim, mm, kf)).all(seg.from, seg.to, ...kArgs)) {
                 const bk = bucketStart(x.h, b.step, tzMs);
                 const name = x.k || '?';
                 let ix = dimIdx.get(name);
@@ -498,11 +670,14 @@ function rangeAgg(since, until, tzMin, unitHint, dim) {
     }
     const t = totals;
     return {
-        since: sinceTs || null, until: untilTs, bucket: b.unit,
+        since: sinceTs || null, until: untilTs, bucket: b.unit, mode: mm,
         totals: { ...t, hit: t.in ? +(t.cached / t.in * 100).toFixed(1) : 0, avg_ms: t.requests ? Math.round(t.ms / t.requests) : 0, avg_ttft: t.requests ? Math.round(t.ttft / t.requests) : 0, tps: tpsOf(t.out, t.ms, t.ttft) },
         errors, matched, scanned: matched, segs, truncated: false, series: list,
         dim: dim || null, dim_names: dimNames,
         by_model: derived(byModel), by_provider: derived(byProvider), by_key: derived(byKey),
+        by_key_model: Object.fromEntries(Object.entries(byPair).map(([k, mmap]) => [k,
+            Object.entries(mmap).map(([model, v]) => ({ model, requests: v.requests, in: v.in, out: v.out, cached: v.cached }))
+                .sort((a, b2) => b2.requests - a.requests).slice(0, 40)])),
     };
 }
 // （区间聚合已全部走 SQL：整点读汇总表、零头读明细表，无需再缓存扫盘结果）
@@ -517,26 +692,68 @@ function storageInfo() {
     try { json = fs.readdirSync(STATS_DIR).filter((f) => /^requests-\d{4}-\d{2}-\d{2}\.jsonl$/.test(f)).length; } catch { }
     return { db_bytes: db, rows: TOTAL, json_days: JSON_KEEP_DAYS, json_files: json, errors: ERRORS };
 }
-function statsSnapshot(opts = {}) {
+// 普通用户的总览：只看自己加入的组（组内全部成员的用量，便于判断共享额度）
+function poolUsageAgg(since, until, pools) {
+    const out = {};
+    if (!pools || !pools.length) return out;
+    const s = Number.isFinite(since) && since > 0 ? since : 0;
+    const e = Number.isFinite(until) && until > 0 ? until : Date.now();
+    const ph = pools.map(() => '?').join(',');
+    for (const seg of segments(s, e)) {
+        const sql = seg.raw
+            ? `SELECT COALESCE(pool,'') p, COALESCE(provider,'') pr, COUNT(*) n, SUM(in_tok) i, SUM(out_tok) o
+               FROM requests WHERE ts >= ? AND ts < ? AND pool IN (${ph}) GROUP BY 1, 2`
+            : `SELECT COALESCE(pool,'') p, COALESCE(provider,'') pr, SUM(requests) n, SUM(in_tok) i, SUM(out_tok) o
+               FROM rollup_hour WHERE hour >= ? AND hour < ? AND pool IN (${ph}) GROUP BY 1, 2`;
+        for (const x of DB.prepare(sql).all(seg.from, seg.to, ...pools)) {
+            const m = out[x.p] || (out[x.p] = {});
+            const cur = m[x.pr || '(未路由)'] || (m[x.pr || '(未路由)'] = { requests: 0, in: 0, out: 0 });
+            cur.requests += x.n || 0; cur.in += x.i || 0; cur.out += x.o || 0;
+        }
+    }
+    return out;
+}
+function statsSnapshot(opts = {}, who = null) {
+    const isAdmin = !who || !!who.admin;
+    const myKeys = isAdmin ? null : (CFG.keys || []).filter((k) => k.owner === who.name).map((k) => k.name);
+    const myPools = isAdmin ? [] : userPools(who.name);
+    const mode = isAdmin ? (opts.mode === 'direct' ? 'direct' : 'pool') : 'all';   // 用户口径：不区分 pool/direct，只看自己的 key
     const tzMin = Number.isFinite(opts.tz) ? opts.tz : TZ_DEFAULT_MIN;
     const ranged = (opts.since != null && Number.isFinite(opts.since)) || (opts.until != null && Number.isFinite(opts.until));
-    const r = rangeAgg(opts.since, opts.until, tzMin, opts.unit, opts.dim);
+    const r = rangeAgg(opts.since, opts.until, tzMin, opts.unit, opts.dim, mode, myKeys);
+    // 两种口径各多少条：概览里切到没数据的那一边时可以给出明确提示
+    const s0 = Number.isFinite(r.since) ? r.since : 0, s1 = Number.isFinite(r.until) ? r.until : Date.now();
+    let counts = { pool: 0, direct: 0 };
+    try {
+        const kf = keyCondSql(myKeys), kArgs = myKeys || [];
+        const c = DB.prepare(`SELECT SUM(CASE WHEN COALESCE(pool,'') <> '' THEN 1 ELSE 0 END) p,
+            SUM(CASE WHEN COALESCE(pool,'') = '' THEN 1 ELSE 0 END) d
+            FROM requests WHERE ts >= ? AND ts < ?${kf}`).get(s0, s1, ...kArgs) || {};
+        counts = { pool: c.p || 0, direct: c.d || 0 };
+    } catch { }
+    const cfgModels = isAdmin ? (CFG.models || []) : (CFG.models || []).filter((m) => myPools.includes((modelPoolOf(m) || {}).pool || ''));
+    const cfgKeys = (CFG.keys || []).filter((k) => isAdmin || (k.owner === who.name)).map((k) => k.name);
+    const cfgProviders = isAdmin ? Object.keys(CFG.providers || {})
+        : [...new Set(myPools.flatMap((pn) => poolMembers((CFG.pools || {})[pn]).map((m) => m.provider)))];
     return {
         now: Date.now(), uptime_s: Math.round((Date.now() - STARTED) / 1000),
+        mode: r.mode, mode_counts: counts,
         total: r.matched, errors: r.errors, totals: r.totals,
-        by_model: r.by_model, by_provider: r.by_provider, by_key: r.by_key,
+        by_model: r.by_model, by_provider: r.by_provider, by_key: r.by_key, by_key_model: r.by_key_model,
         series: r.series, bucket: r.bucket, tz_min: tzMin,
         dim: r.dim, dim_names: r.dim_names,
         range: ranged ? { since: r.since, until: r.until, matched: r.matched, segs: r.segs } : null,
         storage: storageInfo(),
+        ...(isAdmin ? {} : { my_pools: myPools, pool_usage: poolUsageAgg(opts.since, opts.until, myPools) }),
         config: {
             enabled: isEnabled(),
             capture: captureInfo(),
-            models: CFG.models || [],
-            keys: (CFG.keys || []).map((k) => k.name),
-            providers: Object.keys(CFG.providers || {}),
-            routes: (CFG.routes || []).map((r) => `${r.model_regex} -> ${r.provider}/${r.format}`),
+            models: cfgModels,
+            keys: cfgKeys,
+            providers: cfgProviders,
+            routes: isAdmin ? (CFG.routes || []).map((r) => `${r.model_regex} -> ${r.pool ? 'pool:' + r.pool : r.provider}/${r.format}`) : [],
             listen: CFG.listen,
+            api_base: CFG.api_base || '',
         },
     };
 }
@@ -589,12 +806,26 @@ function authenticate(req) {
     // x-goog-api-key：Google SDK / 原生 Gemini 客户端的标准头
     const key = bearer || (req.headers['x-api-key'] || '').trim() || (req.headers['x-goog-api-key'] || '').trim();
     const hit = KEYS.get(key);
+    if (!hit) return null;
     // allow：该 key 的模型白名单（config.keys[].models）。null/空 = 不限制，全部模型可用（默认行为）。
-    return hit ? { name: hit.name, session_id: hit.session_id, key, protocol: hit.protocol || '', interop: !!hit.protocol_interop, allow: Array.isArray(hit.models) && hit.models.length ? hit.models : null } : null;
+    let pools = Array.isArray(hit.pools) && hit.pools.length ? hit.pools : null;
+    // 用户生成的 key：动态限定在该用户加入的上游组（用户后来加入/退出组立即生效；不写死 key 上）。
+    if (!pools && hit.owner) {
+        const u = panelUser(hit.owner);
+        if (!u || u.role !== 'admin') {
+            const up = userPools(hit.owner);
+            pools = up.length ? up : ['__none__'];             // 没加入任何组＝一个模型都不给
+        }
+    }
+    return {
+        name: hit.name, session_id: hit.session_id, user_agent: hit.user_agent || '', key, protocol: hit.protocol || '', interop: !!hit.protocol_interop,
+        allow: Array.isArray(hit.models) && hit.models.length ? hit.models : null, pools,
+        owner: hit.owner || '', role: hit.owner ? (panelUser(hit.owner) || {}).role || 'user' : 'admin',
+    };
 }
 // 客户端 key 的模型白名单判定。白名单为空 = 全部放开（默认）。
 // 匹配口径：优先按对外模型名精确比对；其次按「上游实体」（provider + upstream_model）比对，
-// 这样客户端用带前缀名（ocg/gpt-x）或不带前缀的裸名（gpt-x，走兜底路由）都会被认成同一个模型。
+// 这样客户端用带前缀名（pfx/model-a）或不带前缀的裸名（model-a，走兜底路由）都会被认成同一个模型。
 // 对外用 404/403 而不是悄悄成功——白名单只决定「键能用什么」，不改变路由语义。
 const ALLOW_ENTITY = new Map();          // 白名单数组指纹 -> Set(上游实体)
 function allowedEntities(allow) {
@@ -610,35 +841,413 @@ function allowedEntities(allow) {
     ALLOW_ENTITY.set(sig, set);
     return set;
 }
-function modelAllowed(auth, model) {
-    if (!auth || !auth.allow) return true;
+// 模型归属哪个上游组：与 routeFor 同口径（按路由顺序取第一条匹配且有效的规则）
+function modelPoolOf(model) {
     const m = String(model || '');
+    for (const r of CFG.routes || []) {
+        let hit = false;
+        try { hit = new RegExp(r.model_regex).test(m); } catch { continue; }
+        if (!hit) continue;
+        if (r.pool) { if ((CFG.pools || {})[r.pool]) return { pool: r.pool, provider: null }; continue; }
+        if ((CFG.providers || {})[r.provider]) return { pool: poolForProvider(r.provider), provider: r.provider };
+    }
+    return null;
+}
+function modelAllowed(auth, model) {
+    if (!auth) return true;
+    const m = String(model || '');
+    // key 绑定上游组后：只认这些组里的模型（隔离）。空/缺字段＝不限制（旧行为）。
+    if (auth.pools) {
+        const mp = modelPoolOf(m);
+        if (!mp || !mp.pool || !auth.pools.includes(mp.pool)) return false;
+    }
+    if (!auth.allow) return true;
     if (auth.allow.includes(m)) return true;
     const rt = routeFor(m);
     return !!rt && allowedEntities(auth.allow).has(rt.provider + '|' + rt.upstream_model);
 }
-function routeFor(model) {
+// ---------------- 上游池：多上游负载均衡 / 容灾（config.pools）----------------
+// 路由用 "pool": "<池名>" 代替 "provider": "<供应商>"。
+// 元数据路径（/v1/models、白名单、档位查询）调 routeFor(id) 不带 ctx → 恒取主成员，结果确定、不会每次刷新都变。
+// 请求路径传 ctx.stickyKey（客户端 key 的 session_id）→ 由策略决定本次成员，失败还能在成员之间切换。
+const POOL_STRATEGIES = ['sticky', 'quota', 'rr', 'least', 'failover'];
+// 这些状态码视为「换一家还能成」：限流、过载、上游 5xx、Cloudflare 系错误
+const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529]);
+const POOL_HEALTH = new Map();       // "池|供应商" -> { fails, until }（纯内存，重启清零）
+const POOL_RR = new Map();           // 池 -> 轮询计数
+const POOL_INFLIGHT = new Map();     // "池|供应商" -> 进行中请求数（least 策略用）
+const POOL_PIN = new Map();          // "池|客户端key" -> { provider, at }（quota 策略的粘性记忆）
+
+function poolDef(name) { return name ? ((CFG.pools || {})[name] || null) : null; }
+// 该供应商现在能提供哪些「上游模型名」：按它自己的前缀路由 + 模型清单推导，例如 pfx/model-a → model-a
+function providerCapModels(name) {
+    const out = new Set();
     for (const r of CFG.routes || []) {
-        if (new RegExp(r.model_regex).test(model)) {
-            const p = CFG.providers[r.provider];
-            if (!p) continue;
-            const bare = r.strip && model.startsWith(r.strip) ? model.slice(r.strip.length) : model;
-            return {
-                provider: r.provider, providerCfg: p, format: r.format,
-                strip: r.strip || '', responses_regex: r.responses_regex || null,
-                upstream_model: (r.model_map || {})[model] || bare,
-            };
+        if (r.provider !== name || !r.strip) continue;
+        for (const m of CFG.models || []) if (String(m).startsWith(r.strip)) out.add(String(m).slice(r.strip.length));
+    }
+    return out;
+}
+// 成员能提供的上游模型名集合；返回 null＝不限制（成员显式清单为空且推导不出，保持兼容）
+function memberCaps(m) {
+    if (Array.isArray(m.models) && m.models.length) return new Set(m.models.map((x) => String(x)));
+    const auto = providerCapModels(m.provider);
+    return auto.size ? auto : null;
+}
+// 供应商属于哪个组（唯一命中才算，多个组同时包含同一家 → 不自动接管，避免歧义）
+// auto_providers !== false 时，组会接管成员供应商现有路由的模型——组不需要自己的前缀也能用。
+function poolForProvider(prov) {
+    if (!prov) return null;
+    const hits = Object.keys(CFG.pools || {}).filter((n) => {
+        const d = CFG.pools[n];
+        if (!d || d.auto_providers === false) return false;
+        return poolMembers(d).some((m) => m.provider === prov);
+    });
+    return hits.length === 1 ? hits[0] : null;
+}
+function poolMembers(def) {
+    const out = [];
+    for (const m of (def && def.members) || []) {
+        const o = typeof m === 'string' ? { provider: m } : (m || {});
+        if (!o.provider || !(CFG.providers || {})[o.provider]) continue;   // 成员指到不存在的供应商 → 跳过（不静默报错）
+        const w = Number(o.weight);
+        out.push({
+            provider: o.provider, weight: Number.isFinite(w) && w > 0 ? w : 1, model: o.model ? String(o.model) : '',
+            models: Array.isArray(o.models) ? o.models.map((x) => String(x)) : [],
+        });
+    }
+    return out;
+}
+const poolHealthKey = (pool, provider) => pool + '|' + provider;
+function poolUsable(pool, provider) {
+    const h = POOL_HEALTH.get(poolHealthKey(pool, provider));
+    return !h || !h.until || h.until <= Date.now();
+}
+// 成功清零；连续失败到阈值 → 进冷却期。冷却期内只要有别的可用成员就不会被挑中，全套挂了则无视冷却硬试。
+function poolMark(pool, provider, ok, def) {
+    const k = poolHealthKey(pool, provider);
+    if (ok) { POOL_HEALTH.delete(k); return; }
+    const maxFails = Number(def && def.max_fails) > 0 ? Number(def.max_fails) : 2;
+    const cool = Number(def && def.cooldown_sec) > 0 ? Number(def.cooldown_sec) : 60;
+    const h = POOL_HEALTH.get(k) || { fails: 0, until: 0 };
+    h.fails += 1;
+    if (h.fails >= maxFails) { h.fails = 0; h.until = Date.now() + cool * 1000; log('POOL COOLDOWN', pool, provider, `${cool}s`); }
+    POOL_HEALTH.set(k, h);
+}
+function poolInflight(pool, provider, d) {
+    const k = poolHealthKey(pool, provider);
+    const n = (POOL_INFLIGHT.get(k) || 0) + d;
+    if (n > 0) POOL_INFLIGHT.set(k, n); else POOL_INFLIGHT.delete(k);
+}
+// 记一次成员失败（同一成员只保留最后一次，避免换协议重试把列表撑乱）
+function noteAttempt(trail, provider, status, error) {
+    const row = { provider, status: status || 0, error: String(error || '').slice(0, 300) };
+    const i = trail.findIndex((t) => t.provider === provider);
+    if (i >= 0) trail[i] = row; else trail.push(row);
+}
+// 全挂时的统一错误体：人工可读提示 + 每个成员各自的失败原因（人和客户端都能看懂）。
+// `pools.<名>.fail_message` 可自定义提示文本，支持 {n}（成员数）/ {detail}（「名称(状态)」列表）占位。
+function poolFailBody(plan, trail, lastTxt) {
+    const rows = trail && trail.length ? trail : [];
+    const brief = rows.map((t) => `${t.provider}(${t.status ? t.status : '连接失败'})`).join('、') || '未知';
+    const tpl = String((plan && plan.def && plan.def.fail_message) || '').trim();
+    const hint = tpl
+        ? tpl.replace(/\{n\}/g, String(rows.length)).replace(/\{detail\}/g, brief)
+        : `上游全部不可用（${rows.length} 个）：${brief}。请稍后重试；若持续如此，请检查这组上游的订阅、额度或网络。`;
+    const last = String(lastTxt || (rows[rows.length - 1] || {}).error || '').slice(0, 300).trim();
+    return {
+        hint,
+        message: last ? `${hint}\n最后一次上游错误：${last}` : hint,
+        attempts: rows.map((t) => ({ provider: t.provider, status: t.status || 0, error: String(t.error || '').slice(0, 300) })),
+    };
+}
+// 全家桶都挂了该回什么状态码：全是因为同一个 4xx 配置类错误（如三家都 401）→ 如实回 4xx，否则 503（上游不可用）
+function poolFailStatus(trail) {
+    const codes = (trail || []).map((t) => t.status || 0);
+    if (!codes.length) return 503;
+    const bad = codes.filter((c) => !(c >= 400 && c < 500 && !RETRYABLE_STATUS.has(c)));
+    if (!bad.length && codes.every((c) => c === codes[0])) return codes[0];
+    return 503;
+}
+
+function fnv32(str) {                          // 稳定哈希（sticky 用；同一 key 永远落到同一成员）
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+}
+function weightedPick(members, slot) {         // 把 [0,total) 的整数 slot 按权重映射到成员下标
+    const total = members.reduce((a, m) => a + m.weight, 0);
+    let s = ((slot % total) + total) % total;
+    for (let i = 0; i < members.length; i++) { s -= members[i].weight; if (s < 0) return i; }
+    return members.length - 1;
+}
+function poolRtOf(r, m, upstreamModel) {
+    return {
+        provider: m.provider, providerCfg: CFG.providers[m.provider], format: r.format,
+        strip: r.strip || '', responses_regex: r.responses_regex || null,
+        upstream_model: m.model || upstreamModel, pool: r.pool, weight: m.weight,
+    };
+}
+// ---------------- 成员剩余额度（quota 策略用；两种来源统一成「剩余百分比」）----------------
+// official：打供应商自己的 usage 接口（providers.<n>.quota_url；留空时按 config.quota.usage.url 的域名从 base_url 派生）。
+//           每个账号周期起点不同没关系——比的是「已用百分比」，各自相对各自的周期。
+// local   ：没有额度接口的订阅（火山引擎 plan 之类）→ 用网关自己记的用量除以 providers.<n>.quota.amount，
+//           周期默认「月」（quota.cycle 可改 hour/day/week/month，quota.cycle_day 可改每月几号起算）。
+//           单位 quota.unit 默认 tokens（最通用），可选 cost（需要价格表收录该模型）或 requests。
+// 缓存 60s + 后台定时刷；poolPlan 只读缓存、绝不 await（额度接口慢/挂了不能拖住请求）。
+const POOL_QUOTA_TTL_MS = Math.max(15e3, Number(CFG.pool_quota_ttl_sec || 60) * 1000);
+const POOL_QUOTA_CACHE = new Map();     // provider -> 统一快照（见 quotaSnapshotOf）
+function quotaCfgOf(p) { return (p && typeof p.quota === 'object' && p.quota) ? p.quota : {}; }
+function quotaUrlOf(p) {
+    if (!p) return '';
+    const q = quotaCfgOf(p);
+    if (q.url) return String(q.url);
+    if (p.quota_url) return String(p.quota_url);
+    const b = String(p.base_url || '').replace(/\/+$/, '');
+    // 派生：base_url 与 config.quota.usage.url 同源时，用 base_url + '/usage'
+    const useUrl = ((CFG.quota || {}).usage || {}).url || '';
+    try { if (useUrl && new URL(b).origin === new URL(useUrl).origin) return b + '/usage'; } catch { }
+    return '';
+}
+// 本周期起点（默认月、+08:00 时区、每月 1 号起算）
+function quotaCycleStartMs(p) {
+    const q = quotaCfgOf(p);
+    const unit = ['hour', 'day', 'week', 'month'].includes(q.cycle) ? q.cycle : 'month';
+    const tz = (Number.isFinite(Number(q.tz_offset_min)) ? Number(q.tz_offset_min) : 480) * 60000;
+    const d = new Date(Date.now() + tz);
+    const Y = d.getUTCFullYear(), M = d.getUTCMonth(), D = d.getUTCDate(), H = d.getUTCHours();
+    let s;
+    if (unit === 'hour') s = Date.UTC(Y, M, D, H);
+    else if (unit === 'day') s = Date.UTC(Y, M, D);
+    else if (unit === 'week') s = Date.UTC(Y, M, D - ((d.getUTCDay() + 6) % 7));
+    else {
+        const anchor = Math.min(28, Math.max(1, Number(q.cycle_day) || 1));
+        s = (D >= anchor) ? Date.UTC(Y, M, anchor) : Date.UTC(Y, M - 1, anchor);
+    }
+    return s - tz;
+}
+function localQuotaSnapshot(name, p) {
+    const q = quotaCfgOf(p);
+    const amount = Number(q.amount);
+    if (!(amount > 0)) return { ok: false, source: 'none', error: '未配置额度（quota.amount 或 quota.url）', at: Date.now() };
+    const unit = ['tokens', 'cost', 'requests'].includes(q.unit) ? q.unit : 'tokens';
+    const start = quotaCycleStartMs(p);
+    let rows;
+    try { rows = DB.prepare('SELECT ts, model, in_tok, out_tok, cached FROM requests WHERE provider = ? AND ts >= ?').all(name, start); }
+    catch (e) { return { ok: false, source: 'local', error: '查询统计失败: ' + e.message, at: Date.now() }; }
+    let used = 0, unpriced = 0;
+    for (const r of rows) {
+        if (unit === 'requests') { used += 1; continue; }
+        if (unit === 'cost') {
+            const c = goModelCost(r.model, { in: r.in_tok, out: r.out_tok, cached: r.cached }, r.ts).cost;
+            if (c == null) { unpriced++; continue; }
+            used += c;
+        } else used += (r.in_tok || 0) + (r.out_tok || 0);
+    }
+    const percent = Math.max(0, Math.min(1000, used / amount * 100));
+    return {
+        ok: true, source: 'local', at: Date.now(),
+        headroom: Math.max(0, Math.min(100, 100 - percent)), percent: +percent.toFixed(2),
+        local: { unit, amount, used: +used.toFixed(unit === 'cost' ? 4 : 0), requests: rows.length, cycle: q.cycle || 'month', start, unpriced },
+    };
+}
+async function officialQuotaSnapshot(name, p) {
+    const url = quotaUrlOf(p);
+    const at = Date.now();
+    if (!url) return { ok: false, source: 'none', error: '未配置额度查询（quota.url）', at };
+    const key = process.env[p.api_key_env] || '';
+    if (!key) return { ok: false, source: 'official', error: `key 未配置（${p.api_key_env}）`, at };
+    try {
+        const r = await fetch(url, {
+            headers: {
+                Authorization: 'Bearer ' + key, Accept: 'application/json',
+                'User-Agent': p.user_agent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            },
+            signal: AbortSignal.timeout(12000),
+        });
+        const t = await r.text();
+        if (!r.ok) return { ok: false, source: 'official', error: `HTTP ${r.status}: ${t.slice(0, 120)}`, at };
+        const u = (JSON.parse(t).usage) || {};
+        const pick = (x) => (x && typeof x === 'object') ? { percent: Number(x.percent || 0), status: x.status || '', resets_at: x.resetsAt || null } : null;
+        const windows = { rolling: pick(u.rolling), weekly: pick(u.weekly), monthly: pick(u.monthly) };
+        const ps = Object.values(windows).filter(Boolean).map((x) => x.percent).filter((n) => Number.isFinite(n));
+        if (!ps.length) return { ok: false, source: 'official', error: '返回里没有可用的 percent', at };
+        const pct = Math.max(...ps);
+        return { ok: true, source: 'official', at, windows, percent: +pct.toFixed(2), headroom: Math.max(0, Math.min(100, 100 - pct)) };
+    } catch (e) {
+        return { ok: false, source: 'official', error: String((e && e.message) || e).slice(0, 140), at };
+    }
+}
+async function quotaSnapshotOf(name) {
+    const p = (CFG.providers || {})[name] || {};
+    const q = quotaCfgOf(p);
+    const url = quotaUrlOf(p);
+    const mode = q.mode === 'official' || q.mode === 'local' ? q.mode : (url ? 'official' : 'local');
+    return mode === 'official' ? officialQuotaSnapshot(name, p) : localQuotaSnapshot(name, p);
+}
+// quota 策略的池成员才有必要算额度（省得给没在用的人打接口/扫库）
+function quotaProviders() {
+    const set = new Set();
+    for (const p of Object.values(CFG.pools || {})) {
+        if (!p || p.strategy !== 'quota') continue;
+        for (const m of (p.members || [])) {
+            const n = typeof m === 'string' ? m : (m && m.provider);
+            if (n && (CFG.providers || {})[n]) set.add(n);
         }
+    }
+    return [...set];
+}
+async function refreshQuotas() {
+    for (const n of quotaProviders()) {
+        const snap = await quotaSnapshotOf(n);
+        const old = POOL_QUOTA_CACHE.get(n);
+        POOL_QUOTA_CACHE.set(n, snap);
+        if (!snap.ok && (!old || old.ok)) log('QUOTA FAIL', n, snap.error);
+        else if (snap.ok && snap.source === 'local' && snap.local && snap.local.unpriced) log('QUOTA UNPRICED', n, `${snap.local.unpriced} 条请求的模型不在价格表里`);
+    }
+}
+
+// 返回 { name, def, strategy, order:[rt...] }：order[0]＝本次首选，后面是失败时可换的成员（已按策略排好序）
+function poolPlan(poolName, r, upstreamModel, ctx) {
+    const def = poolDef(poolName);
+    if (!def) return null;
+    const members = poolMembers(def);
+    if (!members.length) return null;
+    const strategy = POOL_STRATEGIES.includes(def.strategy) ? def.strategy : 'sticky';
+    // 只保留「能提供这个上游模型」的成员：某模型只在部分成员里有，就只在它们之间均衡
+    const capsOf = members.map((m) => ({ m, caps: memberCaps(m) }));
+    const capable = capsOf.filter((x) => !x.caps || x.caps.has(String(upstreamModel))).map((x) => x.m);
+    if (!capable.length) return { name: poolName, def, strategy, order: [], upstream_model: String(upstreamModel), reason: 'no-capable-member' };
+    const all = capable.map((m) => ({ m, rt: poolRtOf(r, m, upstreamModel) }));
+    const live = all.filter((x) => poolUsable(poolName, x.m.provider));
+    const usable = live.length ? live : all;         // 全在冷却 → 无视冷却硬试（否则没有任何可用上游）
+    const weights = usable.map((x) => x.m);
+    let start = 0;
+    if (strategy === 'rr') {
+        const n = (POOL_RR.get(poolName) || 0) + 1;
+        POOL_RR.set(poolName, n);
+        start = weightedPick(weights, n - 1);
+    } else if (strategy === 'quota') {
+        // 按「剩余额度最多」选，但同一个客户端 key 会粘在原来的成员上：
+        // 只有当它比最优那家落后超过 margin 个百分点（或它挂了/进冷却）才换 —— 这样不会每个请求都换家，缓存保得住。
+        const margin = Number(def.quota_margin) >= 0 ? Number(def.quota_margin) : 2;
+        const heads = usable.map((x) => {
+            const s = POOL_QUOTA_CACHE.get(x.m.provider);
+            return (s && s.ok && Number.isFinite(s.headroom)) ? s.headroom : null;
+        });
+        const known = heads.filter((h) => h != null).sort((a, b) => a - b);
+        const mid = known.length ? known[Math.floor(known.length / 2)] : 50;   // 额度未知 → 按已知中位数（既不吸流量也不拉黑）
+        let best = 0, bestH = -Infinity;
+        usable.forEach((x, i) => {
+            const h = (heads[i] == null ? mid : heads[i]) + Math.min(0.9, x.m.weight / 200);  // 权重只在剩余接近时微调
+            if (h > bestH) { bestH = h; best = i; }
+        });
+        const sk = String((ctx && ctx.stickyKey) || '');
+        const pinKey = sk ? poolName + '|' + sk : '';
+        const pin = pinKey ? POOL_PIN.get(pinKey) : null;
+        const pinIdx = pin ? usable.findIndex((x) => x.m.provider === pin.provider) : -1;
+        if (pinIdx >= 0) {
+            const curH = heads[pinIdx] == null ? mid : heads[pinIdx];
+            start = (curH >= bestH - margin) ? pinIdx : best;   // 还够用就继续用老的
+        } else start = best;
+        if (pinKey) {
+            if (POOL_PIN.size > 5000) POOL_PIN.clear();          // 只是个粘性缓存，别无限涨
+            POOL_PIN.set(pinKey, { provider: usable[start].m.provider, at: Date.now() });
+        }
+    } else if (strategy === 'least') {
+        let bestN = Infinity;
+        usable.forEach((x, i) => {
+            const n = POOL_INFLIGHT.get(poolHealthKey(poolName, x.m.provider)) || 0;
+            if (n < bestN) { bestN = n; start = i; }
+        });
+    } else if (strategy === 'sticky') {
+        const sk = String((ctx && ctx.stickyKey) || '');
+        if (sk) start = weightedPick(weights, fnv32(poolName + '|' + sk));
+        // 没给 sticky 键（元数据/探针/定时任务）→ 主成员，行为可预期
+    }
+    const order = [];
+    for (let i = 0; i < usable.length; i++) order.push(usable[(start + i) % usable.length].rt);
+    if (live.length && all.length > live.length) {   // 冷却中的成员排到最后，仅在可用成员全失败后才试
+        for (const x of all) if (!live.includes(x)) order.push(x.rt);
+    }
+    return { name: poolName, def, strategy, order };
+}
+
+function routeFor(model, ctx) {
+    for (const r of CFG.routes || []) {
+        if (!new RegExp(r.model_regex).test(model)) continue;
+        const bare = r.strip && model.startsWith(r.strip) ? model.slice(r.strip.length) : model;
+        const upstreamModel = (r.model_map || {})[model] || bare;
+        if (r.pool) {                                   // 上游池：本次挑一个成员，其余作为失败候选
+            const plan = poolPlan(r.pool, r, upstreamModel, ctx);
+            if (!plan) continue;                        // 池不存在/成员全无效 → 当作这条路由不匹配
+            if (!plan.order.length) return {            // 组里没有能提供该模型的成员
+                __poolEmpty: true, pool: r.pool, poolPlan: plan, format: r.format,
+                strip: r.strip || '', upstream_model: upstreamModel,
+            };
+            const rt = plan.order[0];
+            rt.poolPlan = plan;                         // 请求路径据此换成员重试
+            return rt;
+        }
+        const p = CFG.providers[r.provider];
+        if (!p) continue;
+        const autoPool = poolForProvider(r.provider);   // 该供应商被某个组接管 → 走组的均衡/容灾
+        if (autoPool) {
+            const plan = poolPlan(autoPool, r, upstreamModel, ctx);
+            if (plan) {
+                if (!plan.order.length) return { __poolEmpty: true, pool: autoPool, poolPlan: plan, format: r.format, strip: r.strip || '', upstream_model: upstreamModel };
+                const art = plan.order[0];
+                art.poolPlan = plan;
+                return art;
+            }
+        }
+        return {
+            provider: r.provider, providerCfg: p, format: r.format,
+            strip: r.strip || '', responses_regex: r.responses_regex || null,
+            upstream_model: upstreamModel,
+        };
     }
     return null;
 }
-function upstreamHeaders(p, sessionId, accept, format) {
+// ---- 上游会话身份 & 替代 UA（2026-10-30） ----
+// 缺会话头 → 有的上游直接 400 MissingSessionID；UA 不是浏览器式 → 前置 WAF 会回 403 error 1010。
+// 约定：需要会话头的上游把 provider 的 `x-upstream-session` 写成 `__SESSION__`，运行时解析成「该客户端 key 的 session_id」，
+// 所以会话身份天然与 key 绑定：新建 key 自动生效，不用逐个供应商填 UUID。
+const DEFAULT_ALT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+// 需要会话头的上游：config.session_hosts 列 host 片段（留空＝不自动补头，全靠供应商显式配）
+const isSessionHost = (u) => { const b = String(u || '').toLowerCase(); return (CFG.session_hosts || []).some((h) => h && b.includes(String(h).toLowerCase())); };
+function hdrHas(h, name) { const n = String(name).toLowerCase(); return Object.keys(h || {}).some((k) => k.toLowerCase() === n); }
+function autoUpstreamHeaders(baseUrl, extra) {
+    const h = { ...(extra || {}) };
+    if (isSessionHost(baseUrl) && !hdrHas(h, 'x-upstream-session')) h['x-upstream-session'] = '__SESSION__';
+    return h;
+}
+// 启动 / 重载时补齐默认值（幂等，只补缺，不动已有值）：
+// - 每个客户端 key 都要有稳定的 session_id（老配置没写过 → 补一个并落盘；绝不能每次请求新生成）
+// - config.session_hosts 里的上游都要带 x-upstream-session（__SESSION__ 解析成该 key 的 session_id）与替代 UA
+function ensureSessionDefaults(cfg) {
+    let changed = false;
+    for (const k of cfg.keys || []) {
+        if (!k.session_id) { k.session_id = crypto.randomUUID(); changed = true; log('SESSION id auto', k.name, k.session_id); }
+    }
+    for (const [n, p] of Object.entries(cfg.providers || {})) {
+        if (!isSessionHost(p.base_url)) continue;
+        const h = autoUpstreamHeaders(p.base_url, p.extra_headers);
+        if (JSON.stringify(h) !== JSON.stringify(p.extra_headers || {})) {
+            p.extra_headers = h; changed = true; log('SESSION header auto', n, 'x-upstream-session=__SESSION__');
+        }
+        if (!p.user_agent) { p.user_agent = DEFAULT_ALT_UA; changed = true; log('UA auto', n, '补替代 UA'); }
+    }
+    return changed;
+}
+function upstreamHeaders(p, sessionId, accept, format, uaOverride) {
     const h = {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ' + (process.env[p.api_key_env] || ''),
         'Accept': accept,
     };
-    if (p.user_agent) h['User-Agent'] = p.user_agent;
+    const ua = String(uaOverride || '').trim() || p.user_agent;   // key 上配了就用 key 的（更具体），否则用供应商的
+    if (ua) h['User-Agent'] = ua;
     for (const [k, v] of Object.entries(p.extra_headers || {})) h[k] = v === '__SESSION__' ? sessionId : v;
     if (format === 'messages') {
         // Anthropic 风格端点：Bearer 会 401 Missing API key，必须 x-api-key
@@ -737,7 +1346,7 @@ function clampEffort(effort, supported) {
 }
 
 // 把 body 里客户端显式给的档位夹到该 provider|model 支持的档位（没配、没探测过＝完全不干预）
-// 先查 model_effort_overrides 的厂商自有映射（例：medium→high、xhigh→max），再就近降级
+// 先查 model_effort_overrides 里配的自家映射（例如某模型 medium→high、另一个 xhigh→max），再就近降级
 function clampBodyEffort(body, rt) {
     const sup = effortsFor(rt.provider, rt.upstream_model);
     if (!sup) return body;
@@ -842,9 +1451,52 @@ async function probeModelEfforts(id, opts = {}) {
     log('PROBE efforts', effortKeyOf(rt.provider, rt.upstream_model), `${out.levels.length}/${levels.length} 档接受`, out.note ? '（' + out.note + '）' : '');
     return out;
 }
-function buildUpstream(rt, format, body, sessionId, ctx) {
+// ---------------- body 字段屏蔽（providers.<名>.strip_body_fields）----------------
+// 客户端把会话/身份标识塞在 JSON body 里时（如 session_id / conversation_id / prompt_cache_key），
+// chat 路径与两条直通路径都是「整包转发」，会原样带给上游 → 由该配置按字段名删掉。
+// 默认不配＝完全不删（保持旧行为）。结构性字段永不删，配了也忽略（删了就坏请求）。
+const PROTECTED_BODY_FIELDS = new Set(['model', 'messages', 'input', 'stream', 'tools', 'system', 'instructions', 'stream_options']);
+// 供应商额度配置归一化：{url, mode, unit, amount, cycle, cycle_day, tz_offset_min}
+function normQuotaCfg(v) {
+    if (v === null || v === undefined || v === '') return null;
+    if (typeof v !== 'object' || Array.isArray(v)) throw new Error('quota 必须是对象');
+    const out = {};
+    if (v.url) { const u = String(v.url).trim(); if (!/^https?:\/\//.test(u)) throw new Error('quota.url 必须以 http:// 或 https:// 开头'); out.url = u; }
+    if (v.mode) { const m = String(v.mode).trim(); if (!['auto', 'official', 'local'].includes(m)) throw new Error('quota.mode 只能是 auto / official / local'); out.mode = m; }
+    if (v.unit) { const u = String(v.unit).trim(); if (!['tokens', 'cost', 'requests'].includes(u)) throw new Error('quota.unit 只能是 tokens / cost / requests'); out.unit = u; }
+    if (v.amount !== undefined && v.amount !== '' && v.amount !== null) { const a = Number(v.amount); if (!(a > 0)) throw new Error('quota.amount 必须大于 0'); out.amount = a; }
+    if (v.cycle) { const c = String(v.cycle).trim(); if (!['hour', 'day', 'week', 'month'].includes(c)) throw new Error('quota.cycle 只能是 hour / day / week / month'); out.cycle = c; }
+    if (v.cycle_day !== undefined && v.cycle_day !== '' && v.cycle_day !== null) { const d = Number(v.cycle_day); out.cycle_day = Math.min(28, Math.max(1, Number.isFinite(d) ? d : 1)); }
+    if (v.tz_offset_min !== undefined && v.tz_offset_min !== '' && v.tz_offset_min !== null) { const t = Number(v.tz_offset_min); out.tz_offset_min = Number.isFinite(t) ? t : 480; }
+    return Object.keys(out).length ? out : null;
+}
+function normStripFields(v) {
+    const raw = Array.isArray(v) ? v : String(v == null ? '' : v).split(/[,\s]+/);
+    const out = [];
+    for (const x of raw) {
+        const k = String(x || '').trim();
+        if (!k || out.includes(k)) continue;
+        if (PROTECTED_BODY_FIELDS.has(k)) throw new Error(`不能屏蔽结构性字段: ${k}（会直接把请求搞坏）`);
+        out.push(k);
+        if (out.length > 50) throw new Error('屏蔽字段最多 50 个');
+    }
+    return out;
+}
+function stripBodyFields(payload, list, label) {
+    if (!Array.isArray(list) || !list.length) return payload;
+    const hit = [];
+    for (const k of list) {
+        const key = String(k || '').trim();
+        if (!key || PROTECTED_BODY_FIELDS.has(key)) continue;
+        if (Object.prototype.hasOwnProperty.call(payload, key)) { delete payload[key]; hit.push(key); }
+    }
+    if (hit.length) log('STRIP body', label || '', hit.join(','));
+    return payload;
+}
+
+function buildUpstream(rt, format, body, sessionId, ctx, ua) {
     body = clampBodyEffort(body, rt);              // 客户端给了不支持的档位 → 就近降级（没配置过＝不动）
-    const headers = upstreamHeaders(rt.providerCfg, sessionId, body.stream ? 'text/event-stream' : 'application/json', format);
+    const headers = upstreamHeaders(rt.providerCfg, sessionId, body.stream ? 'text/event-stream' : 'application/json', format, ua);
     if (format === 'responses') {
         let reasonInj = 0;
         const payload = chatToResponses(body, { echoReason: !!rt.providerCfg.reasoning_echo, provider: rt.provider, onInject: (n) => { reasonInj += n; } });
@@ -860,7 +1512,8 @@ function buildUpstream(rt, format, body, sessionId, ctx) {
         return { url: rt.providerCfg.base_url + path, payload: chatToGemini(body, rt.upstream_model, rt.providerCfg), headers };
     }
     const payload = { ...body, model: rt.upstream_model };
-    // 实测部分上游的 /chat/completions 不认 OpenAI 新式的 role:"developer"，会回 422 "Endpoint is unavailable."
+    stripBodyFields(payload, rt.providerCfg.strip_body_fields, rt.provider);
+    // 实测某上游 /chat/completions 不认 OpenAI 新式的 role:"developer"，会回 422 "Endpoint is unavailable."
     // （还骗过 PROTOCOL_HINT 让网关误换协议）。developer 与 system 等价，统一降级成 system 最稳；
     // responses / messages 两条路各自已把 developer 处理掉了，这里只管 chat。
     if (Array.isArray(payload.messages)) payload.messages = payload.messages.map((m) => (m && m.role === 'developer') ? { ...m, role: 'system' } : m);
@@ -1217,14 +1870,14 @@ function chatToMessages(body, model, providerCfg) {
             name: t.function?.name, description: t.function?.description, input_schema: t.function?.parameters || { type: 'object', properties: {} },
         }));
     }
-    // 推理档位 → messages 端点。形状因上游而异：实测有的上游只认 thinking.type=adaptive + output_config.effort，
+    // 推理档位 → messages 端点。形状因上游而异：实测某上游只认 thinking.type=adaptive + output_config.effort，
     // 发 thinking.type=enabled 直接 400。所以按 provider.thinking_style 走，缺省 none＝完全不发（宁可不带，也不 400）。
     if (body.thinking && typeof body.thinking === 'object') payload.thinking = body.thinking;
     if (body.output_config && typeof body.output_config === 'object') payload.output_config = body.output_config;
     const style = (providerCfg || {}).thinking_style || 'none';
     const eff = body.reasoning_effort;
     if (eff != null && style !== 'none') {
-        if (style === 'adaptive') {                      // 实测形状（adaptive 上游的 /messages）
+        if (style === 'adaptive') {                      // 实测形状（adaptive + output_config.effort）
             if (!payload.thinking) payload.thinking = { type: 'adaptive' };
             if (!payload.output_config) payload.output_config = { effort: eff };
         } else if (style === 'enabled') {                 // Anthropic 原生：max_tokens 必须 > budget_tokens
@@ -1243,7 +1896,7 @@ function chatToMessages(body, model, providerCfg) {
 }
 
 // ---------------- Gemini（Google Generative Language）协议 ----------------
-// 用途：部分上游的 gemini-* 模型只认原生 Google 协议（/chat/completions、/responses、/messages 全回
+// 用途：部分上游的 Google 系模型只认原生 Google 协议（/chat/completions、/responses、/messages 全回
 // 400 ModelProtocolUnsupported），必须按 contents/parts 发。这里只做「上游一侧」的翻译：
 //   请求  chat → generateContent 载荷        chatToGemini()
 //   流式  generateContent SSE → chat 事件     pumpGemini()
@@ -1883,46 +2536,87 @@ async function serveChatPipeline(req, res, opts) {
             : messagesToChatReq(body);
     const model = body.model, ip = clientIp(req);
     const base = { ts: t0, key: auth.name, model, stream: !!body.stream, ip, cproto: clientProto, conv: convFingerprint(chatBody), req_bytes: Buffer.byteLength(opts.rawBody || ''), res_bytes: 0 };
+    base.pool = (rt && rt.poolPlan && rt.poolPlan.name) || '';   // 记这条请求走的是哪个上游组（空＝网关直连供应商）
     countOut(res, base);
     capture('client_req', { cproto: clientProto, ip, key: auth.name, model, stream: !!body.stream, body });
     const ctx = { id: 'chatcmpl-' + crypto.randomBytes(10).toString('hex'), created: Math.floor(t0 / 1000), model, t0, provider: rt.provider, usage: {}, hasTool: false, ttft: null, reasonPending: [], reasonInj: 0 };
     const sink = clientProto === 'chat' ? chatSink(res, ctx) : clientProto === 'responses' ? responsesSink(res, ctx) : messagesSink(res, ctx);
     let status = 200, format = resolveFormat(rt), piped = false;
     const hold = startFirstByteHold(res, !!body.stream);
+    let hitRt = rt;                                   // 实际命中的成员（池模式下可能已换过，记录/日志都用它）
+    const trail = [];                                 // 池模式下每个成员的失败原因（全挂时回给客户端）
     try {
         const ac = new AbortController();
         const onClose = () => { if (!res.writableEnded) { try { ac.abort(); } catch { } } };
         req.on('close', onClose);
-        let upRes, lastTxt = '';
-        for (const cand of protocolCandidates(rt)) {
-            format = cand;
-            const { url, payload, headers } = buildUpstream(rt, format, chatBody, auth.session_id, ctx);
-            capture('upstream_req', { candidate: cand, cproto: clientProto, url, key: auth.name, model, upstream_model: rt.upstream_model, payload });
-            const payloadStr = jdump(payload);
-            ctx.up_len = payloadStr.length;
-            ctx.pre4k = preHash(payloadStr, 4096); ctx.pre16k = preHash(payloadStr, 16384); ctx.pre64k = preHash(payloadStr, 65536);
-            upRes = await fetch(url, { method: 'POST', headers, body: payloadStr, signal: ac.signal });
-            capture('upstream_status', { candidate: cand, status: upRes.status, ok: upRes.ok });
-            if (upRes.ok) break;
-            lastTxt = await upRes.text(); status = upRes.status;
-            const auto = !rt.format || rt.format === 'auto';
-            if (auto && protocolMismatch(status, lastTxt)) { log('PROTOCOL SWITCH', rt.provider, rt.upstream_model, `${format} 不支持, 试下一个`, `(${status})`); continue; }
-            break;
+        let upRes, lastTxt = '', netErr = null;
+        // 候选顺序：池模式下是「策略选中的成员 + 失败可换的其它成员」，每人对自己的协议候选各试一遍。
+        const plan = rt.poolPlan || null;
+        const attempts = plan ? plan.order : [rt];
+        for (let ai = 0; ai < attempts.length; ai++) {
+            const aRt = attempts[ai];
+            if (plan) { ctx.provider = aRt.provider; poolInflight(plan.name, aRt.provider, +1); }
+            let gotOk = false, switchMember = false;
+            try {
+                const cands = protocolCandidates(aRt);
+                let triedN = 0;
+                for (const cand of cands) {
+                    triedN++;
+                    format = cand;
+                    const { url, payload, headers } = buildUpstream(aRt, format, chatBody, auth.session_id, ctx, auth.user_agent);
+                    capture('upstream_req', { candidate: cand, cproto: clientProto, url, key: auth.name, model, upstream_model: aRt.upstream_model, provider: aRt.provider, payload });
+                    const payloadStr = jdump(payload);
+                    ctx.up_len = payloadStr.length;
+                    ctx.pre4k = preHash(payloadStr, 4096); ctx.pre16k = preHash(payloadStr, 16384); ctx.pre64k = preHash(payloadStr, 65536);
+                    try {
+                        upRes = await fetch(url, { method: 'POST', headers, body: payloadStr, signal: ac.signal });
+                    } catch (fe) {
+                        if (fe.name === 'AbortError') throw fe;       // 客户端断开：不重试
+                        netErr = fe; upRes = null; status = 0; lastTxt = 'fetch failed: ' + fe.message;
+                        noteAttempt(trail, aRt.provider, 0, fe.message);
+                        log('UPSTREAM FETCH FAIL', aRt.provider, format, aRt.upstream_model, fe.message);
+                        switchMember = ai < attempts.length - 1;
+                        break;
+                    }
+                    capture('upstream_status', { candidate: cand, provider: aRt.provider, status: upRes.status, ok: upRes.ok });
+                    if (upRes.ok) { gotOk = true; break; }
+                    lastTxt = await upRes.text(); status = upRes.status;
+                    noteAttempt(trail, aRt.provider, status, lastTxt);
+                    const auto = !aRt.format || aRt.format === 'auto';
+                    if (auto && protocolMismatch(status, lastTxt)) { log('PROTOCOL SWITCH', aRt.provider, aRt.upstream_model, `${format} 不支持, 试下一个`, `(${status})`); continue; }
+                    // 限流/过载/上游 5xx：同一家换协议也没用，直接换下一个成员（还有人就换）
+                    if (RETRYABLE_STATUS.has(status) && ai < attempts.length - 1) { switchMember = true; break; }
+                    break;
+                }
+                // 四种协议全被这家拒（说明该模型在它家不可用）→ 换下一个成员再试
+                if (!gotOk && triedN >= cands.length && plan && ai < attempts.length - 1) switchMember = true;
+            } finally {
+                if (plan) poolInflight(plan.name, aRt.provider, -1);
+            }
+            if (gotOk) { hitRt = aRt; if (plan) { poolMark(plan.name, aRt.provider, true, plan.def); log('POOL HIT', plan.name, aRt.provider, model); } break; }
+            if (plan) poolMark(plan.name, aRt.provider, false, plan.def);
+            if (!switchMember) break;                 // 不可重试 → 就地按错误收尾
+            log('POOL FAILOVER', plan.name, aRt.provider, '->', attempts[ai + 1].provider, `(${status || 'network'})`);
         }
         req.off('close', onClose);
-        if (upRes.ok) { const fk = rt.provider + '|' + rt.upstream_model; if ((!rt.format || rt.format === 'auto') && FORMAT_OVERRIDES[fk] !== format) { FORMAT_OVERRIDES[fk] = format; saveOverrides(); } }
-        if (!upRes.ok) {
+        if (upRes && upRes.ok) { const fk = hitRt.provider + '|' + hitRt.upstream_model; if ((!hitRt.format || hitRt.format === 'auto') && FORMAT_OVERRIDES[fk] !== format) { FORMAT_OVERRIDES[fk] = format; saveOverrides(); } }
+        if (!upRes || !upRes.ok) {
+            const pFail = plan ? poolFailBody(plan, trail, lastTxt) : null;
+            const outStatus = plan ? poolFailStatus(trail) : (upRes ? status : 502);
             let parsed = null; try { parsed = JSON.parse(lastTxt); } catch { }
-            log('UPSTREAM ERROR', status, rt.provider, format, model, lastTxt.slice(0, 300));
+            log('UPSTREAM ERROR', outStatus, hitRt.provider, format, model, String(pFail ? pFail.hint : lastTxt).slice(0, 300));
             if (hold.sent) {   // 保活已提前发出 200 响应头 → 改发 SSE 错误事件收尾
-                record({ ...base, status, ms: Date.now() - t0, provider: rt.provider, upstream_model: rt.upstream_model, format, error: lastTxt.slice(0, 500) });
-                log('HOLD-ERROR', `上游 ${status} 且已提前开流，改发 SSE 错误事件`);
-                sink.error(parsed?.error?.message || lastTxt.slice(0, 800) || 'upstream error');
+                record({ ...base, status: outStatus, ms: Date.now() - t0, provider: hitRt.provider, upstream_model: hitRt.upstream_model, format, error: String(pFail ? pFail.message : lastTxt).slice(0, 500) });
+                log('HOLD-ERROR', `上游 ${outStatus} 且已提前开流，改发 SSE 错误事件`);
+                sink.error(pFail ? pFail.message : (parsed?.error?.message || lastTxt.slice(0, 800) || 'upstream error'));
                 sink.finalize('stop', {});
                 return res.end();
             }
-            record({ ...base, status, ms: Date.now() - t0, provider: rt.provider, upstream_model: rt.upstream_model, format, error: lastTxt.slice(0, 500) });
-            return sendJson(res, status, parsed?.error ? { error: parsed.error } : { error: { message: lastTxt.slice(0, 800) || 'upstream error', type: 'upstream_error' } });
+            record({ ...base, status: outStatus, ms: Date.now() - t0, provider: hitRt.provider, upstream_model: hitRt.upstream_model, format, error: String(pFail ? pFail.message : lastTxt).slice(0, 500) });
+            const errBody = pFail
+                ? { error: { message: pFail.message, type: 'upstream_pool_exhausted', code: 'upstream_unavailable', hint: pFail.hint, attempts: pFail.attempts } }
+                : parsed?.error ? { error: parsed.error } : { error: { message: lastTxt.slice(0, 800) || 'upstream error', type: 'upstream_error' } };
+            return sendJson(res, outStatus, errBody);
         }
         if (body.stream) hold.open();
         if (format === 'responses') {
@@ -1962,37 +2656,26 @@ async function serveChatPipeline(req, res, opts) {
             sink.finalize(finishOf(ctx), ctx.usage);
             if (!res.writableEnded) res.end();
         }
-        record({ ...base, status, ms: Date.now() - t0, provider: rt.provider, upstream_model: rt.upstream_model, format, usage: ctx.usage, ttft_ms: ctx.ttft || 0, has_tool: ctx.hasTool, reason_inj: ctx.reasonInj || 0, up_len: ctx.up_len, up_res_bytes: ctx.up_res_bytes || 0, pre4k: ctx.pre4k, pre16k: ctx.pre16k, pre64k: ctx.pre64k });
-        log('OK', clientProto + '->' + format, rt.upstream_model, `in=${ctx.usage.in || 0} out=${ctx.usage.out || 0} cached=${ctx.usage.cached || 0}`, `${Date.now() - t0}ms`);
+        record({ ...base, status, ms: Date.now() - t0, provider: hitRt.provider, upstream_model: hitRt.upstream_model, format, usage: ctx.usage, ttft_ms: ctx.ttft || 0, has_tool: ctx.hasTool, reason_inj: ctx.reasonInj || 0, up_len: ctx.up_len, up_res_bytes: ctx.up_res_bytes || 0, pre4k: ctx.pre4k, pre16k: ctx.pre16k, pre64k: ctx.pre64k });
+        log('OK', clientProto + '->' + format, hitRt.upstream_model, `in=${ctx.usage.in || 0} out=${ctx.usage.out || 0} cached=${ctx.usage.cached || 0}`, `${Date.now() - t0}ms`);
     } catch (e) {
         hold.stop();
         if (e.name === 'AbortError') {
             log('CLIENT ABORT', model, `${Date.now() - t0}ms`);
-            record({ ...base, status: 499, ms: Date.now() - t0, provider: rt.provider, error: 'client aborted' });
+            record({ ...base, status: 499, ms: Date.now() - t0, provider: hitRt.provider, error: 'client aborted' });
             try { res.end(); } catch { }
             return;
         }
         log('GATEWAY ERROR', e.message);
-        record({ ...base, status: 500, ms: Date.now() - t0, provider: rt.provider, error: e.message });
+        record({ ...base, status: 500, ms: Date.now() - t0, provider: hitRt.provider, error: e.message });
         if (!res.headersSent) sendJson(res, 500, { error: { message: e.message, type: 'gateway_error' } });
         else try { res.end(); } catch { }
     }
 }
 
 // ---------------- 拉取上游模型列表 ----------------
-async function fetchProviderModels(b) {
-    const prefix = String(b.prefix || '').trim().replace(/\/+$/, '');
-    if (!prefix) throw new Error('缺少前缀');
-    const route = (CFG.routes || []).find((r) => r.strip === prefix + '/');
-    if (!route) throw new Error(`没有前缀为 ${prefix} 的供应商`);
-    const prov = (CFG.providers || {})[route.provider];
-    if (!prov) throw new Error('供应商配置缺失');
-    const key = process.env[prov.api_key_env] || '';
-    const base = String(prov.base_url || '').replace(/\/+$/, '');
-    const extra = {};
-    if (prov.user_agent) extra['User-Agent'] = prov.user_agent;
-    for (const [k, v] of Object.entries(prov.extra_headers || {})) extra[k] = v;
-
+async function fetchModelsFrom(base, key, extra = {}) {
+    base = String(base || '').replace(/\/+$/, '');
     const attempt = async (mode) => {
         const headers = { 'Accept': 'application/json', ...extra };
         if (mode === 'bearer') headers['Authorization'] = 'Bearer ' + key;
@@ -2006,14 +2689,28 @@ async function fetchProviderModels(b) {
         const ids = (Array.isArray(arr) ? arr : []).map((x) => typeof x === 'string' ? x : (x.id || x.name || x.model)).filter(Boolean);
         return { ok: true, ids };
     };
-
     let res = await attempt('bearer');
     if (!res.ok && [401, 403].includes(res.status)) res = await attempt('x-api-key');
     if (!res.ok) throw new Error(`上游 /models 拉取失败（HTTP ${res.status}）：${res.text}`);
+    return res.ids;
+}
+async function fetchProviderModels(b) {
+    const prefix = String(b.prefix || '').trim().replace(/\/+$/, '');
+    if (!prefix) throw new Error('缺少前缀');
+    const route = (CFG.routes || []).find((r) => r.strip === prefix + '/' && r.provider);
+    if (!route) throw new Error(`没有前缀为 ${prefix} 的供应商（上游池路由不支持拉取，请直接填上游模型名）`);
+    const prov = (CFG.providers || {})[route.provider];
+    if (!prov) throw new Error('供应商配置缺失');
+    const key = process.env[prov.api_key_env] || '';
+    const base = String(prov.base_url || '').replace(/\/+$/, '');
+    const extra = {};
+    if (prov.user_agent) extra['User-Agent'] = prov.user_agent;
+    for (const [k, v] of Object.entries(prov.extra_headers || {})) extra[k] = v;
+    const ids = await fetchModelsFrom(base, key, extra);
     const have = new Set((CFG.models || []).filter((m) => m.startsWith(prefix + '/')));
     return {
-        provider: route.provider, prefix, endpoint: base + '/models', count: res.ids.length,
-        models: res.ids.map((id) => ({ id, added: have.has(prefix + '/' + id) })),
+        provider: route.provider, prefix, endpoint: base + '/models', count: ids.length,
+        models: ids.map((id) => ({ id, added: have.has(prefix + '/' + id) })),
     };
 }
 
@@ -2045,28 +2742,41 @@ function effortInfo(id) {
         at: probe.at || '', note: probe.note || '', rejected: probe.rejected || {},
     };
 }
-function configView() {
-    const providers = Object.entries(CFG.providers || {}).map(([name, p]) => {
-        const route = (CFG.routes || []).find((r) => r.provider === name && r.strip);
-        return {
-            name,
-            base_url: p.base_url,
-            api_key_env: p.api_key_env,
-            has_key: !!(process.env[p.api_key_env] || '').length,
-            user_agent: !!p.user_agent,
-            reasoning_echo: !!p.reasoning_echo,
-            extra_headers: Object.keys(p.extra_headers || {}),
-            prefix: route ? route.strip.replace(/\/$/, '') : '',
-            models: (CFG.models || []).filter((m) => route && m.startsWith(route.strip)).length,
-            test: providerIsTest(p),                       // 是否测试供应商（显式标记优先，否则按 base_url 推断）
-            test_explicit: p.test !== undefined,           // 是否已显式写进 config.json
-            efforts: normEfforts((CFG.model_efforts || {})[effortKeyOf(name, '*')]),   // 该供应商的默认推理档位（模型级没配时生效）
-        };
-    });
+function configView(who) {
+    const me = who || null;
+    const isAdmin = !me || !!me.admin;
+    const mine = me ? me.name : '';
+    const joined = !isAdmin ? userPools(mine) : [];
+    const visiblePools = isAdmin ? null : new Set([...joined, ...joinablePools()]);
+    const providers = Object.entries(CFG.providers || {})
+        .filter(([, p]) => isAdmin || (p && p.owner === mine))
+        .map(([name, p]) => {
+            const route = (CFG.routes || []).find((r) => r.provider === name && r.strip);
+            return {
+                name,
+                base_url: p.base_url,
+                api_key_env: p.api_key_env,
+                has_key: !!(process.env[p.api_key_env] || '').length,
+                user_agent: !!p.user_agent,
+                reasoning_echo: !!p.reasoning_echo,
+                strip_body_fields: Array.isArray(p.strip_body_fields) ? p.strip_body_fields.length : 0,
+                extra_headers: Object.keys(p.extra_headers || {}),
+                prefix: route ? route.strip.replace(/\/$/, '') : '',
+                models: (CFG.models || []).filter((m) => route && m.startsWith(route.strip)).length,
+                test: providerIsTest(p),                       // 是否测试供应商（显式标记优先，否则按 base_url 推断）
+                test_explicit: p.test !== undefined,           // 是否已显式写进 config.json
+                efforts: normEfforts((CFG.model_efforts || {})[effortKeyOf(name, '*')]),   // 该供应商的默认推理档位（模型级没配时生效）
+                owner: p.owner || '',
+                mine: !!p.owner && p.owner === mine,
+            };
+        });
     const MT = {};                                            // 每个模型的累计量（模型列表页显示用）
     for (const x of DB.prepare('SELECT model, SUM(requests) n, SUM(in_tok) i, SUM(out_tok) o, SUM(cached) c FROM rollup_hour GROUP BY model').all())
         MT[x.model] = { requests: x.n, in: x.i || 0, out: x.o || 0, cached: x.c || 0 };
-    const models = (CFG.models || []).map((id) => {
+    const models = (CFG.models || []).filter((id) => {
+        if (isAdmin) return true;
+        return joined.includes((modelPoolOf(id) || {}).pool || '');   // 普通用户只看到自己加入的组里的模型
+    }).map((id) => {
         const rt = routeFor(id);
         const st = MT[id] || {};
         return {
@@ -2078,21 +2788,56 @@ function configView() {
             configured: rt ? !!(CFG.model_formats || {})[rt.provider + '|' + rt.upstream_model] : false,
             requests: st.requests || 0, in: st.in || 0, out: st.out || 0, cached: st.cached || 0,
             effort: effortInfo(id),                    // 推理档位：生效/手工/探测/拒绝原因
+            ...(isAdmin ? {} : { pool: (modelPoolOf(id) || {}).pool || '' }),
         };
     });
+    // 普通用户拿到的路由只覆盖「可见组里的成员供应商」，不泄露其它上游配置
+    const poolProv = new Set();
+    if (!isAdmin) for (const pn of visiblePools) for (const m of poolMembers((CFG.pools || {})[pn])) poolProv.add(m.provider);
     return {
         enabled: isEnabled(),
+        me: me ? { name: me.name, role: me.role, via: me.via, admin: isAdmin, pools: isAdmin ? Object.keys(CFG.pools || {}) : joined, joinable: isAdmin ? [] : joinablePools() } : null,
         providers,
-        routes: (CFG.routes || []).map((r) => ({ model_regex: r.model_regex, provider: r.provider, strip: r.strip || '', format: r.format || 'auto' })),
+        routes: (CFG.routes || []).filter((r) => isAdmin || (r.provider && poolProv.has(r.provider) && !r.pool))
+            .map((r) => ({ model_regex: r.model_regex, provider: r.provider || null, pool: r.pool || null, strip: r.strip || '', format: r.format || 'auto' })),
+        pools: Object.entries(CFG.pools || {}).filter(([n]) => isAdmin || (visiblePools && visiblePools.has(n))).map(([name, p]) => ({
+            name,
+            strategy: POOL_STRATEGIES.includes(p && p.strategy) ? p.strategy : 'sticky',
+            cooldown_sec: Number(p && p.cooldown_sec) > 0 ? Number(p.cooldown_sec) : 60,
+            max_fails: Number(p && p.max_fails) > 0 ? Number(p.max_fails) : 2,
+            quota_margin: Number(p && p.quota_margin) >= 0 ? Number(p.quota_margin) : 2,
+            fail_message: String((p && p.fail_message) || ''),
+            auto_providers: (p && p.auto_providers) !== false,
+            user_join: (p && p.user_join) === true,
+            joined: isAdmin ? true : joined.includes(name),
+            members: poolMembers(p).map((m) => ({ ...m, mine: !!me && ((CFG.providers || {})[m.provider] || {}).owner === mine })),
+            routes: isAdmin ? (CFG.routes || []).filter((r) => r.pool === name).map((r) => r.model_regex) : [],
+        })),
         models,
-        keys: (CFG.keys || []).map((k) => ({ name: k.name, protocol: k.protocol || '', interop: !!k.protocol_interop, models: Array.isArray(k.models) ? k.models : [] })),
+        keys: (CFG.keys || []).filter((k) => isAdmin || (k.owner && k.owner === mine))
+            .map((k) => ({ name: k.name, owner: k.owner || '', protocol: k.protocol || '', interop: !!k.protocol_interop, models: Array.isArray(k.models) ? k.models : [], pools: Array.isArray(k.pools) ? k.pools : [], session_id: k.session_id || '', user_agent: k.user_agent || '' })),
         formats: Object.keys(CFG.model_formats || {}).length,
         listen: CFG.listen,
+        api_base: CFG.api_base || '',
         dashboard_hosts: (CFG.dashboard_auth || {}).hosts || [],
+        ...(isAdmin ? { users: panelUserList() } : {}),
     };
 }
 // 客户端 key 的模型白名单校验：去空、去重、必须存在于对外模型清单。
 // 返回 [] 表示「全部模型」（等于不限制）；传 null/undefined 也当 []。
+// 客户端 key 的上游组绑定校验：去空、去重、必须存在于 config.pools。
+function normKeyPools(cfg, input) {
+    if (input === null || input === undefined) return [];
+    if (!Array.isArray(input)) throw new Error('pools 必须是上游组名数组（空数组＝不绑定）');
+    const out = [];
+    for (const raw of input) {
+        const n = String(raw || '').trim();
+        if (!n) continue;
+        if (!(cfg.pools || {})[n]) throw new Error('上游组不存在: ' + n);
+        if (!out.includes(n)) out.push(n);
+    }
+    return out;
+}
 function normKeyModels(input) {
     if (input === null || input === undefined) return [];
     if (!Array.isArray(input)) throw new Error('models 必须是模型名数组（空数组＝全部模型）');
@@ -2106,21 +2851,140 @@ function normKeyModels(input) {
     }
     return out;
 }
-function applyConfigChange(p, b) {
+// 删掉一个供应商在配置里的全部痕迹（路由/模型/组成员/协议记忆/环境变量）。用户自助退出组时复用。
+function dropProviderFromCfg(cfg, name) {
+    const prov = (cfg.providers || {})[name];
+    if (!prov) return { routes: 0, models: 0 };
+    const rt = (cfg.routes || []).find((r) => r.provider === name && r.strip);
+    const strip = rt ? String(rt.strip) : '';
+    const routesBefore = (cfg.routes || []).length;
+    cfg.routes = (cfg.routes || []).filter((r) => r.provider !== name);
+    let models = 0;
+    if (strip) {
+        const before = (cfg.models || []).length;
+        cfg.models = (cfg.models || []).filter((m) => !String(m).startsWith(strip));
+        models = before - cfg.models.length;
+    }
+    for (const p of Object.values(cfg.pools || {})) {
+        if (!p || !Array.isArray(p.members)) continue;
+        p.members = p.members.filter((m) => (typeof m === 'string' ? m : (m && m.provider)) !== name);
+    }
+    for (const key of ['model_formats', 'model_efforts', 'model_effort_overrides', 'effort_probes']) {
+        for (const k of Object.keys(cfg[key] || {})) if (k.startsWith(name + '|')) delete cfg[key][k];
+    }
+    delete cfg.providers[name];
+    const still = Object.values(cfg.providers || {}).some((pr) => pr && pr.api_key_env === prov.api_key_env);
+    if (!still && prov.api_key_env) { try { removeEnvVar(prov.api_key_env); } catch { } }
+    return { routes: routesBefore - (cfg.routes || []).length, models };
+}
+function normUpstreamModels(input) {
+    const arr = Array.isArray(input) ? input : String(input || '').split(/[,，\s]+/);
+    return [...new Set(arr.map((x) => String(x).trim()).filter((x) => /^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,119}$/.test(x)))].slice(0, 100);
+}
+function applyConfigChange(p, b, who) {
     const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    const me = who || { admin: true, name: (CFG.dashboard_auth || {}).username || 'admin', role: 'admin' };
+    const isAdmin = !!me.admin;
+    const membersOf = (def, c) => (((def && def.members) || []).map((m) => (typeof m === 'string' ? { provider: m } : (m || {}))))
+        .filter((m) => m.provider && (c.providers || {})[m.provider]);
+    // 管理员专属：组管理、供应商/模型管理、总开关、用户管理。普通用户走 /api/user/* 与自己的 key。
+    const ADMIN_ONLY = new Set([
+        '/api/config/pool', '/api/config/pool/delete',
+        '/api/config/provider', '/api/config/provider/update', '/api/config/provider/delete',
+        '/api/config/model', '/api/config/models/bulk', '/api/config/model/delete',
+        '/api/config/model/efforts', '/api/config/provider/efforts',
+        '/api/config/toggle', '/api/config/toggle_capture', '/api/config/reload',
+        '/api/config/user', '/api/config/user/delete',
+    ]);
+    if (!isAdmin && ADMIN_ONLY.has(p)) throw new Error('只有管理员能执行该操作');
+    const keyOf = (name) => {
+        const k = (cfg.keys || []).find((x) => x.name === String(name || '').trim());
+        if (!k) throw new Error('key 不存在: ' + name);
+        if (!isAdmin && k.owner !== me.name) throw new Error('无权操作别人的 key: ' + name);
+        return k;
+    };
     const prefixRe = (pf) => '^' + pf + '/';
+    // ---------------- 上游组（多上游负载均衡） ----------------
+    if (p === '/api/config/pool') {
+        const name = String(b.name || '').trim();
+        if (!/^[a-z0-9][a-z0-9_-]{1,30}$/i.test(name)) throw new Error('组名只能字母数字-_（2–31 字符）');
+        const members = [];
+        for (const m of (Array.isArray(b.members) ? b.members : [])) {
+            const provider = String((m && m.provider) || '').trim();
+            if (!provider) continue;
+            if (!cfg.providers || !cfg.providers[provider]) throw new Error('供应商不存在: ' + provider);
+            if (members.some((x) => x.provider === provider)) throw new Error('同一家供应商在一个组里只能出现一次: ' + provider);
+            const w = Number(m.weight);
+            const model = m.model ? String(m.model).trim() : '';
+            // 成员可用模型清单（上游模型名，可选）；留空＝按该供应商前缀路由自动推导
+            const rawCap = Array.isArray(m.models) ? m.models : String(m.models || '').split(/[,，\s]+/);
+            const caps = [...new Set(rawCap.map((x) => String(x).trim()).filter(Boolean))].slice(0, 200);
+            members.push({ provider, weight: Number.isFinite(w) && w > 0 ? Math.min(100, Math.round(w)) : 1, ...(model ? { model } : {}), ...(caps.length ? { models: caps } : {}) });
+        }
+        const strategy = POOL_STRATEGIES.includes(b.strategy) ? b.strategy : 'sticky';
+        const cool = Math.min(3600, Math.max(1, Math.round(Number(b.cooldown_sec) || 60)));
+        const maxFails = Math.min(20, Math.max(1, Math.round(Number(b.max_fails) || 2)));
+        const msg = String(b.fail_message || '').trim().slice(0, 300);
+        cfg.pools = cfg.pools || {};
+        const existed = !!cfg.pools[name];
+        cfg.pools[name] = {
+            strategy, cooldown_sec: cool, max_fails: maxFails,
+            ...(strategy === 'quota' ? { quota_margin: Math.min(50, Math.max(0, Number.isFinite(Number(b.quota_margin)) ? Number(b.quota_margin) : 2)) } : {}),
+            ...(msg ? { fail_message: msg } : {}),
+            ...(b.auto_providers === false ? { auto_providers: false } : {}),
+            ...(b.user_join === true ? { user_join: true } : {}),
+            members,
+        };
+        // 组不再挂路由：成员供应商的现有路由会被自动接管（同名模型直接进均衡，不需要指定供应商）
+        saveConfig(cfg); reloadConfig();
+        log('CONFIG pool', name, `${existed ? 'update' : 'create'} members=${members.length}`);
+        return { pool: name, existed, members: members.length };
+    }
+    if (p === '/api/config/pool/delete') {
+        const name = String(b.name || '').trim();
+        if (!cfg.pools || !cfg.pools[name]) throw new Error('上游组不存在: ' + name);
+        const bound = (cfg.routes || []).filter((r) => r.pool === name);
+        if (bound.length && !b.force) {
+            throw new Error(`组 ${name} 还绑着 ${bound.length} 条路由（${bound.map((r) => r.model_regex).join(', ')}）——确认要连路由一起删就勾选强制删除`);
+        }
+        cfg.routes = (cfg.routes || []).filter((r) => r.pool !== name);
+        let unbound = 0;                                   // 顺手把 key 上的这个组解绑，避免留下悬空引用
+        for (const k of (cfg.keys || [])) {
+            if (!Array.isArray(k.pools) || !k.pools.includes(name)) continue;
+            const left = k.pools.filter((x) => x !== name);
+            if (left.length) k.pools = left; else delete k.pools;
+            unbound++;
+        }
+        delete cfg.pools[name];
+        saveConfig(cfg); reloadConfig();
+        log('CONFIG pool delete', name, `routes=${bound.length} keys_unbound=${unbound}`);
+        return { removed_pool: name, removed_routes: bound.length, keys_unbound: unbound };
+    }
+    if (p === '/api/config/route/pool') {          // 已废弃：组不再挂路由（保留了明确的报错，避免老脚本静默失效）
+        throw new Error('组的「绑定路由」功能已移除：组的模型 = 成员供应商现有模型的并集，同名模型自动进均衡');
+    }
     if (p === '/api/config/provider') {
         const name = String(b.name || '').trim();
         if (!/^[a-z0-9][a-z0-9_-]{1,30}$/i.test(name)) throw new Error('供应商名只能字母数字-_（2–31 字符）');
         if (!/^https?:\/\//.test(String(b.base_url || ''))) throw new Error('base_url 必须以 http:// 或 https:// 开头');
         const envName = String(b.api_key_env || (name.toUpperCase().replace(/[^A-Z0-9]/g, '_') + '_API_KEY')).trim();
         cfg.providers = cfg.providers || {};
+        const stripList = normStripFields(b.strip_body_fields);
+        const qUrl = String(b.quota_url || '').trim();
+        if (qUrl && !/^https?:\/\//.test(qUrl)) throw new Error('额度查询 URL 必须以 http:// 或 https:// 开头');
+        const qCfg = normQuotaCfg(b.quota);
+        const pUrl = String(b.base_url).replace(/\/+$/, '');
+        const pExtra = autoUpstreamHeaders(pUrl, b.extra_headers);
+        const pUA = b.user_agent ? String(b.user_agent) : (isSessionHost(pUrl) ? DEFAULT_ALT_UA : '');
         cfg.providers[name] = {
-            base_url: String(b.base_url).replace(/\/+$/, ''),
+            base_url: pUrl,
             api_key_env: envName,
-            ...(b.user_agent ? { user_agent: String(b.user_agent) } : {}),
-            ...(b.extra_headers && typeof b.extra_headers === 'object' ? { extra_headers: b.extra_headers } : {}),
+            ...(pUA ? { user_agent: pUA } : {}),
+            ...(Object.keys(pExtra).length ? { extra_headers: pExtra } : {}),
             ...(b.reasoning_echo ? { reasoning_echo: true } : {}),
+            ...(stripList.length ? { strip_body_fields: stripList } : {}),
+            ...(qUrl ? { quota_url: qUrl } : {}),
+            ...(qCfg ? { quota: qCfg } : {}),
             ...(b.test !== undefined ? { test: !!b.test } : {}),
         };
         if (b.api_key) setEnvVar(envName, String(b.api_key).trim());
@@ -2176,6 +3040,29 @@ function applyConfigChange(p, b) {
         if (b.reasoning_echo !== undefined) {
             if (b.reasoning_echo) { if (!prov.reasoning_echo) { prov.reasoning_echo = true; changed.push('reasoning_echo(开)'); } }
             else if (prov.reasoning_echo) { delete prov.reasoning_echo; changed.push('reasoning_echo(关)'); }
+        }
+        if (b.strip_body_fields !== undefined) {          // body 字段屏蔽（逗号串或数组，留空＝清除）
+            const next = normStripFields(b.strip_body_fields);
+            const cur = Array.isArray(prov.strip_body_fields) ? prov.strip_body_fields : [];
+            if (jdump(next) !== jdump(cur)) {
+                if (next.length) { prov.strip_body_fields = next; changed.push('strip_body_fields:' + next.join(',')); }
+                else { delete prov.strip_body_fields; changed.push('strip_body_fields(已清除)'); }
+            }
+        }
+        if (b.quota_url !== undefined) {                   // 额度查询地址（留空＝按 config.quota.usage.url 的域名从 base_url 派生；其它上游必须显式填）
+            const u = String(b.quota_url).trim();
+            if (u && !/^https?:\/\//.test(u)) throw new Error('额度查询 URL 必须以 http:// 或 https:// 开头');
+            if (u !== String(prov.quota_url || '')) {
+                if (u) { prov.quota_url = u; changed.push('quota_url'); }
+                else { delete prov.quota_url; changed.push('quota_url(已清除)'); }
+            }
+        }
+        if (b.quota !== undefined) {                       // 额度配置（official 官方接口 / local 本地统计）
+            const nq = normQuotaCfg(b.quota);
+            if (jdump(nq) !== jdump(prov.quota || null)) {
+                if (nq) { prov.quota = nq; changed.push('quota'); }
+                else { delete prov.quota; changed.push('quota(已清除)'); }
+            }
         }
         if (b.efforts !== undefined || b.reasoning_efforts !== undefined) {      // 供应商级默认推理档位（该供应商所有模型，模型级可覆盖）
             const lv = parseEffortsInput(b.efforts !== undefined ? b.efforts : b.reasoning_efforts);
@@ -2283,6 +3170,11 @@ function applyConfigChange(p, b) {
     if (p === '/api/config/provider/delete') {
         const name = String(b.name || '').trim();
         if (!cfg.providers || !cfg.providers[name]) throw new Error('供应商不存在: ' + name);
+        // 上游组成员先摘掉再用：直接删会让池里少一个人，甚至变空组（路由全挂），必须显式处理
+        const inPools = Object.entries(cfg.pools || {})
+            .filter(([, pp]) => (pp && Array.isArray(pp.members) ? pp.members : []).some((m) => (typeof m === 'string' ? m : m && m.provider) === name))
+            .map(([pn]) => pn);
+        if (inPools.length) throw new Error(`供应商 ${name} 还在上游组 ${inPools.join('、')} 里，请先把它从这些组里移除（或删掉该组）再删供应商`);
         const routes = (cfg.routes || []).filter((r) => r.provider === name);
         const prefixes = routes.map((r) => r.strip || '').filter(Boolean);
         const before = (cfg.models || []).length;
@@ -2321,50 +3213,88 @@ function applyConfigChange(p, b) {
         if (!/^[a-z0-9][a-z0-9_-]{0,30}$/i.test(name)) throw new Error('key 名只能字母数字-_（≤31 字符）');
         if ((cfg.keys || []).some((k) => k.name === name)) throw new Error('同名 key 已存在');
         const key = 'sk-gw-' + crypto.randomBytes(18).toString('base64url');
-        const models = normKeyModels(b.models);              // 空＝全部模型（默认）
+        let models = normKeyModels(b.models);              // 空＝全部模型（默认）
+        let pools = normKeyPools(cfg, b.pools);            // 空＝不绑定上游组（默认）
+        if (!isAdmin) {                                    // 普通用户：只能给自己建，且限定在自己加入的组
+            const up = userPools(me.name);
+            if (!up.length) throw new Error('你还没有加入任何上游组：先到「上游组」页把自己的供应商加进一个组');
+            if (models.length) {
+                const allowed = new Set((cfg.models || []).filter((m) => up.includes((modelPoolOf(m) || {}).pool || '')));
+                const bad = models.filter((m) => !allowed.has(m));
+                if (bad.length) throw new Error('这些模型不在你加入的组里: ' + bad.join(', '));
+            }
+            pools = [];                                    // 不写死组：鉴权时按 owner 动态限定（加入/退出组立即生效）
+        }
+        // 会话 id 默认生成并与 key 绑定：既是上游 prompt 缓存的命名空间（供应商里写 __SESSION__ 时解析成它），
+        // 也是上游组负载均衡的粘性指纹（sticky / quota 策略的 stickyKey）。UA 同步给一个替代值，防 CF 1010。
+        const kUa = b.user_agent === undefined ? DEFAULT_ALT_UA : String(b.user_agent || '').trim();
+        const kObj = {
+            name, key, session_id: crypto.randomUUID(),
+            ...(kUa ? { user_agent: kUa } : {}),
+            ...(models.length ? { models } : {}), ...(pools.length ? { pools } : {}),
+            ...(isAdmin ? {} : { owner: me.name }),
+        };
         cfg.keys = cfg.keys || [];
-        cfg.keys.push({ name, key, session_id: crypto.randomUUID(), ...(models.length ? { models } : {}) });
+        cfg.keys.push(kObj);
         saveConfig(cfg); reloadConfig();
-        return { name, key, models };
+        return { name, key, models, pools, owner: isAdmin ? '' : me.name, session_id: kObj.session_id, user_agent: kObj.user_agent || '' };
+    }
+    if (p === '/api/config/key/pools') {                 // 该 key 绑定哪些上游组（空数组＝不绑定）
+        if (!isAdmin) throw new Error('普通用户的 key 自动跟随自己加入的上游组，不能单独绑定');
+        const k = keyOf(b.name);
+        const pools = normKeyPools(cfg, b.pools);
+        if (pools.length) k.pools = pools; else delete k.pools;
+        saveConfig(cfg); reloadConfig();
+        log('CONFIG key pools', k.name, pools.join(',') || '(全部)');
+        return { key: k.name, pools };
     }
     if (p === '/api/config/key/models') {              // 该 key 可访问的模型白名单：空数组/省略＝全部（默认）
-        const name = String(b.name || '').trim();
-        const k = (cfg.keys || []).find((x) => x.name === name);
-        if (!k) throw new Error('key 不存在: ' + name);
+        const k = keyOf(b.name);
         const models = normKeyModels(b.models);
+        if (!isAdmin && models.length) {                 // 普通用户只能在自己加入的组里挑
+            const up = userPools(me.name);
+            const bad = models.filter((m) => !up.includes((modelPoolOf(m) || {}).pool || ''));
+            if (bad.length) throw new Error('这些模型不在你加入的组里: ' + bad.join(', '));
+        }
         if (models.length) k.models = models; else delete k.models;
         saveConfig(cfg); reloadConfig();
-        log('CONFIG key models', name, models.length ? `${models.length} 个` : '全部');
-        return { key: name, models, config: configView() };
+        log('CONFIG key models', k.name, models.length ? `${models.length} 个` : '全部');
+        return { key: k.name, models, config: configView(who) };
     }
     if (p === '/api/config/key/delete') {
-        const name = String(b.name || '').trim();
-        if (!(cfg.keys || []).some((k) => k.name === name)) throw new Error('key 不存在: ' + name);
-        const rest = (cfg.keys || []).filter((k) => k.name !== name);
+        const k = keyOf(b.name);
+        const rest = (cfg.keys || []).filter((x) => x.name !== k.name);
         if (!rest.length) throw new Error('这是最后一个 key，删掉就没人能用了');
         cfg.keys = rest;
         saveConfig(cfg); reloadConfig();
-        return { removed_key: name, left: rest.length };
+        return { removed_key: k.name, left: rest.length };
+    }
+    if (p === '/api/config/key/session') {            // 该 key 的上游会话身份：session_id（与 key 绑定，供应商用 __SESSION__ 时生效）+ 替代 UA
+        const k = keyOf(b.name);
+        if (!k.session_id) k.session_id = crypto.randomUUID();     // 老 key 补一个（稳定，别每次请求新生成）
+        if (b.user_agent !== undefined) {
+            const ua = String(b.user_agent || '').trim();
+            if (ua) k.user_agent = ua; else delete k.user_agent;
+        }
+        saveConfig(cfg); reloadConfig();
+        log('CONFIG key session', k.name, k.session_id, k.user_agent ? 'UA=' + k.user_agent.slice(0, 40) : 'UA=(供应商默认)');
+        return { key: k.name, session_id: k.session_id, user_agent: k.user_agent || '', config: configView(who) };
     }
     if (p === '/api/config/key/protocol') {           // 给客户端 key 绑定协议：/v1/models 据此只回该协议的模型（留空＝自动）
-        const name = String(b.name || '').trim();
-        const k = (cfg.keys || []).find((x) => x.name === name);
-        if (!k) throw new Error('key 不存在: ' + name);
+        const k = keyOf(b.name);
         const proto = String(b.protocol || '').toLowerCase();
         if (proto && !['chat', 'responses', 'messages'].includes(proto)) throw new Error('协议只能是 chat / responses / messages，或留空＝自动');
         if (proto) k.protocol = proto; else delete k.protocol;
         saveConfig(cfg); reloadConfig();
-        log('CONFIG key protocol', name, proto || '(自动)');
-        return { key: name, protocol: proto };
+        log('CONFIG key protocol', k.name, proto || '(自动)');
+        return { key: k.name, protocol: proto };
     }
     if (p === '/api/config/key/interop') {            // 协议互转（实验性，按 key，默认关）：允许该 key 的 responses/messages 客户端跨协议用其它协议的模型
-        const name = String(b.name || '').trim();
-        const k = (cfg.keys || []).find((x) => x.name === name);
-        if (!k) throw new Error('key 不存在: ' + name);
+        const k = keyOf(b.name);
         if (b.enabled) k.protocol_interop = true; else delete k.protocol_interop;
         saveConfig(cfg); reloadConfig();
-        log('CONFIG key interop', name, b.enabled ? 'ON' : 'OFF');
-        return { key: name, interop: !!k.protocol_interop };
+        log('CONFIG key interop', k.name, b.enabled ? 'ON' : 'OFF');
+        return { key: k.name, interop: !!k.protocol_interop };
     }
     if (p === '/api/config/toggle') {
         cfg.enabled = b.enabled !== false;
@@ -2378,7 +3308,125 @@ function applyConfigChange(p, b) {
         log('TOGGLE capture', cfg.capture ? 'ON' : 'OFF');
         return { capture: cfg.capture };
     }
-    if (p === '/api/config/reload') { reloadConfig(); return { reloaded: true }; }
+    // ---------------- 普通用户自助：带自己的上游进组 / 退出 ----------------
+    if (p === '/api/user/provider') {
+        if (isAdmin) throw new Error('管理员请用「增加供应商」页与「上游组」页');
+        const pool = String(b.pool || '').trim();
+        const poolDef = (cfg.pools || {})[pool];
+        if (!poolDef) throw new Error('上游组不存在: ' + pool);
+        const already = membersOf(poolDef, cfg).some((m) => ((cfg.providers || {})[m.provider] || {}).owner === me.name);
+        if (poolDef.user_join !== true && !already) throw new Error('这个组不接受用户加入');
+        const label = String(b.name || '').trim();
+        if (!/^[A-Za-z0-9][A-Za-z0-9 ._-]{1,40}$/.test(label)) throw new Error('名称只能字母数字空格 . _ -（2–41 字符）');
+        const baseUrl = String(b.base_url || '').trim().replace(/\/+$/, '');
+        if (!/^https?:\/\//.test(baseUrl)) throw new Error('base_url 必须以 http:// 或 https:// 开头');
+        const apiKey = String(b.api_key || '').trim();
+        if (!apiKey) throw new Error('请填上游 API key');
+        const models = normUpstreamModels(b.models);
+        if (!models.length) throw new Error('至少填一个上游模型名（可点「从上游拉取模型」）');
+        const slug = label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 20) || 'up';
+        const pname = (`u-${me.name}-${slug}`).toLowerCase().replace(/[^a-z0-9_-]/g, '-').slice(0, 31);
+        const existing = (cfg.providers || {})[pname];
+        if (existing && existing.owner !== me.name) throw new Error('供应商名冲突: ' + pname);
+        const envName = 'GW_' + pname.toUpperCase().replace(/[^A-Z0-9]/g, '_') + '_KEY';
+        cfg.providers = cfg.providers || {};
+        // 需要会话头的上游必须带 x-upstream-session，否则回 400 MissingSessionID；UA 不是浏览器式会被前置 WAF 拦。
+        // 这里用 __SESSION__ 占位 → 运行时解析成「该客户端 key 的 session_id」，与 key 天然绑定。
+        const pExtra = autoUpstreamHeaders(baseUrl, (existing || {}).extra_headers);
+        const pUaIn = b.user_agent === undefined ? '' : String(b.user_agent || '').trim();
+        const pUa = pUaIn || (existing || {}).user_agent || (isSessionHost(baseUrl) ? DEFAULT_ALT_UA : '');
+        cfg.providers[pname] = {
+            ...(existing || {}), base_url: baseUrl, api_key_env: envName, owner: me.name,
+            ...(pUa ? { user_agent: pUa } : {}),
+            ...(Object.keys(pExtra).length ? { extra_headers: pExtra } : {}),
+        };
+        setEnvVar(envName, apiKey);
+        const prefix = pname;
+        const re = '^' + prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/';
+        cfg.routes = cfg.routes || [];
+        if (!cfg.routes.some((r) => r.model_regex === re)) {
+            cfg.routes.unshift({ model_regex: re, provider: pname, strip: prefix + '/', format: 'auto', responses_regex: '^(gpt-|grok-)' });
+        }
+        cfg.models = cfg.models || [];
+        const fullIds = models.map((m) => prefix + '/' + m);
+        if (existing) cfg.models = cfg.models.filter((m) => !String(m).startsWith(prefix + '/') || fullIds.includes(m));   // 重提交时清掉旧模型
+        for (const full of fullIds) if (!cfg.models.includes(full)) cfg.models.push(full);
+        // 成员：保留组里原有成员，只替换/追加自己这一条
+        const clean = membersOf(poolDef, cfg).filter((m) => m.provider !== pname).map((m) => ({
+            provider: m.provider, weight: Number(m.weight) > 0 ? Number(m.weight) : 1,
+            ...(m.model ? { model: String(m.model) } : {}),
+            ...(Array.isArray(m.models) && m.models.length ? { models: m.models.map(String) } : {}),
+        }));
+        clean.push({ provider: pname, weight: 1, models });
+        poolDef.members = clean;
+        saveConfig(cfg); reloadConfig();
+        log('USER provider', me.name, pname, '->', pool, models.join(','));
+        return { provider: pname, prefix, pool, models, full_models: fullIds, config: configView(who) };
+    }
+    if (p === '/api/user/leave') {
+        if (isAdmin) throw new Error('管理员请用「上游组」页编辑成员');
+        const pool = String(b.pool || '').trim();
+        const pname = String(b.provider || '').trim();
+        const poolDef = (cfg.pools || {})[pool];
+        if (!poolDef) throw new Error('上游组不存在: ' + pool);
+        const prov = (cfg.providers || {})[pname];
+        if (!prov || prov.owner !== me.name) throw new Error('只能移除自己的供应商');
+        poolDef.members = membersOf(poolDef, cfg).filter((m) => m.provider !== pname).map((m) => ({
+            provider: m.provider, weight: Number(m.weight) > 0 ? Number(m.weight) : 1,
+            ...(m.model ? { model: String(m.model) } : {}),
+            ...(Array.isArray(m.models) && m.models.length ? { models: m.models.map(String) } : {}),
+        }));
+        const stillUsed = Object.values(cfg.pools || {}).some((pd) => membersOf(pd, cfg).some((m) => m.provider === pname));
+        let removed = null;
+        if (!stillUsed) removed = dropProviderFromCfg(cfg, pname);
+        saveConfig(cfg); reloadConfig();
+        log('USER leave', me.name, pname, 'from', pool, stillUsed ? '(组内已摘除)' : '(供应商已删除)');
+        return { pool, provider: pname, deleted: !stillUsed, removed, config: configView(who) };
+    }
+    // ---------------- 管理员：面板用户管理 ----------------
+    if (p === '/api/config/user') {
+        const name = String(b.name || '').trim();
+        if (!USER_RE.test(name)) throw new Error('用户名只能字母数字 . _ -（2–32 字符，首字符字母数字）');
+        const role = b.role === 'admin' ? 'admin' : 'user';
+        if (name === me.name && role !== 'admin') throw new Error('不能把自己降成普通用户');
+        const pw = String(b.password || '');
+        if (pw && pw.length < 6) throw new Error('密码至少 6 位');
+        cfg.users = cfg.users || {};
+        const existed = cfg.users[name] || panelUser(name);
+        if (!existed && !pw) throw new Error('新建用户必须设密码');
+        const salt = (existed && existed.salt) || crypto.randomBytes(8).toString('hex');
+        cfg.users[name] = {
+            role, salt,
+            password_sha256: pw ? hashPw(salt, pw) : existed.password_sha256,
+            created_at: (existed && existed.created_at) || Date.now(),
+        };
+        saveConfig(cfg); reloadConfig();
+        log('CONFIG user', name, role, existed ? 'update' : 'create');
+        return { user: name, role, created: !existed };
+    }
+    if (p === '/api/config/user/delete') {
+        const name = String(b.name || '').trim();
+        if (name === me.name) throw new Error('不能删除当前登录的账号');
+        const u = panelUser(name);
+        if (!u) throw new Error('用户不存在: ' + name);
+        if (u.virtual && name === (CFG.dashboard_auth || {}).username) throw new Error('Basic 管理员账号不能在这里删除（改 dashboard_auth 配置）');
+        if (u.role === 'admin' && panelUserList().filter((x) => x.role === 'admin' && x.name !== name).length === 0) throw new Error('必须保留至少一个管理员');
+        const provs = Object.entries(cfg.providers || {}).filter(([, p]) => p && p.owner === name).map(([n]) => n);
+        const keys = (cfg.keys || []).filter((k) => k.owner === name).map((k) => k.name);
+        if ((provs.length || keys.length) && b.force !== true) {
+            throw new Error(`该用户还拥有 ${provs.length} 个供应商、${keys.length} 个 key；先让他退出组/删 key，或勾选强制删除`);
+        }
+        const removed = { providers: [], keys: keys.length, models: 0 };
+        for (const pn of provs) { const r = dropProviderFromCfg(cfg, pn); removed.providers.push(pn); removed.models += r.models; }
+        cfg.keys = (cfg.keys || []).filter((k) => k.owner !== name);
+        delete cfg.users[name];
+        for (const [t, s] of Object.entries(SESSIONS)) if (s.u === name) delete SESSIONS[t];
+        saveSessions();
+        saveConfig(cfg); reloadConfig();
+        log('CONFIG user delete', name, JSON.stringify(removed));
+        return { removed_user: name, removed };
+    }
+    if (p === '/api/config/reload') { reloadConfig(); if (ensureSessionDefaults(CFG)) saveConfig(CFG); return { reloaded: true }; }
     throw new Error('未知操作: ' + p);
 }
 
@@ -2399,8 +3447,9 @@ function keyProtocolHint(keyName) {
 }
 
 // ---------------- 上游额度/用量 ----------------
-// 上游额度：余额接口 / 用量接口 / 单价表全部从 config.json 读（返回形状按你上游的实际情况改这两个函数）。
-// 单价单位＝每 1M tokens（USD）；cap＝该模型月上限（美元），没有上限填 null。
+// 有的上游提供官方余额接口；有的没有额度接口（上游 issue #31084 / #10448 之类都没实现），
+// 所以按「官方单价 × 网关记录的 token」估算——只覆盖走本网关的流量。
+// 单价表从 config.json 的 prices / peak_prices 读（每 1M tokens，USD；peak_prices 支持峰谷时段）
 const GO_PRICES = (CFG.prices && typeof CFG.prices === 'object') ? CFG.prices : {};
 const GO_PEAK = (CFG.peak_prices && typeof CFG.peak_prices === 'object') ? CFG.peak_prices : {};
 function goUnit(model, atMs) {
@@ -2448,6 +3497,69 @@ function computeGoUsage() {
     }
     return { windows: total, models: [...per.values()].sort((a, b) => b.d30 - a.d30) };
 }
+// ---------------- 订阅周期统计 ----------------
+// 月付订阅：官方 /usage 的 monthly.resetsAt 就是下次续费时刻，往前推日历月即各周期边界。
+// allowance 口径 = 实际成本 × 基数 / 该模型月上限（基数见 config.quota.base_usd），
+// 所以「归一化额度 ÷ 基数」可以直接和供应商控制台里的百分比对齐。
+const GO_BASE_USD = Number((CFG.quota && CFG.quota.base_usd) || 60) || 60;   // 归一化基数：config.quota.base_usd（默认 60）
+const GO_CYCLE_COUNT = 6;                  // 展示最近几个周期
+function monthShift(ms, n) {               // 日历月平移，月末溢出回退到目标月最后一天
+    const d = new Date(ms), day = d.getUTCDate();
+    d.setUTCDate(1);
+    d.setUTCMonth(d.getUTCMonth() + n);
+    const last = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
+    d.setUTCDate(Math.min(day, last));
+    return d.getTime();
+}
+function goCycleAnchor(quota) {            // 下次续费时刻（ms）；官方取不到就用上次记下的锚点顺推
+    const iso = quota && quota.ok && quota.monthly && quota.monthly.resets_at;
+    const t = iso ? Date.parse(iso) : NaN;
+    if (Number.isFinite(t)) {
+        try { DB.prepare("INSERT OR REPLACE INTO meta(k,v) VALUES('quota_cycle_anchor',?)").run(String(t)); } catch { /* ignore */ }
+        return t;
+    }
+    const row = DB.prepare("SELECT v FROM meta WHERE k='quota_cycle_anchor'").get();
+    const prev = row ? Number(row.v) : NaN;
+    if (Number.isFinite(prev) && prev > 0) { let a = prev; while (a <= Date.now()) a = monthShift(a, 1); return a; }
+    return null;
+}
+function computeGoCycles(anchorMs, count = GO_CYCLE_COUNT) {
+    const bounds = [];
+    for (let i = 0; i < count; i++) bounds.push({ lo: monthShift(anchorMs, -i - 1), hi: monthShift(anchorMs, -i) });
+    const oldest = bounds[bounds.length - 1].lo;
+    const out = bounds.map((b) => ({ start: b.lo, end: b.hi, reqs: 0, in: 0, out: 0, cached: 0, cost: 0, allow: 0, priced: 0, unpriced: 0, models: new Map() }));
+    const pfx = (CFG.quota || {}).provider_prefixes || [];
+    const cond = pfx.length ? ' AND (' + pfx.map(() => '(provider LIKE ? OR model LIKE ?)').join(' OR ') + ')' : '';
+    const rows = DB.prepare(`SELECT ts, model, provider, upstream_model, in_tok, out_tok, cached FROM requests
+        WHERE ts >= ?${cond}`).all(oldest, ...pfx.flatMap((p) => [p + '%', p + '%']));
+    for (const r of rows) {
+        const ts = r.ts || 0;
+        const e = out.find((c) => ts >= c.start && ts < c.end);
+        if (!e) continue;
+        const model = String(r.upstream_model || String(r.model || '').replace(/^[^/]*\//, ''));
+        const { cost, cap } = goModelCost(model, { in: r.in_tok || 0, out: r.out_tok || 0, cached: r.cached || 0 }, ts);
+        e.reqs++; e.in += r.in_tok || 0; e.out += r.out_tok || 0; e.cached += r.cached || 0;
+        if (cost == null) { e.unpriced++; continue; }        // 价格表里没有的模型只算请求数
+        e.priced++; e.cost += cost;
+        const allow = cap ? cost * GO_BASE_USD / cap : 0;    // cap=null → 官方 Unlimited 免费档
+        e.allow += allow;
+        const m = e.models.get(model) || { model, reqs: 0, in: 0, out: 0, cached: 0, cost: 0, allow: 0, cap };
+        m.reqs++; m.in += r.in_tok || 0; m.out += r.out_tok || 0; m.cached += r.cached || 0;
+        m.cost += cost; m.allow += allow; e.models.set(model, m);
+    }
+    return out.map((c) => ({
+        start: c.start, end: c.end, reqs: c.reqs, in: c.in, out: c.out, cached: c.cached,
+        cost: +c.cost.toFixed(4), allow: +c.allow.toFixed(4), pct: +(c.allow / GO_BASE_USD * 100).toFixed(2),
+        priced: c.priced, unpriced: c.unpriced,
+        models: [...c.models.values()].sort((a, b) => b.cost - a.cost).slice(0, 12)
+            .map((m) => ({
+                model: m.model, reqs: m.reqs, in: m.in, out: m.out, cached: m.cached,
+                cost: +m.cost.toFixed(4), allow: +m.allow.toFixed(4),
+                pct: m.cap ? +(m.cost / m.cap * 100).toFixed(2) : null,      // 占该模型自身月限额
+                cap: m.cap || null,
+            })),
+    }));
+}
 async function upstreamUsage() {           // 上游用量接口（url / key 环境变量在 config.json 的 quota.usage 里配）
     const qc = (CFG.quota || {}).usage || {};
     if (!qc.url) return { ok: false, error: 'quota.usage.url 未配置' };
@@ -2482,72 +3594,6 @@ async function upstreamBalance() {         // 上游余额接口（url / key 环
         const d = JSON.parse(t), b = (d.balance_infos || [])[0] || {};
         return { ok: true, available: !!d.is_available, currency: b.currency || 'CNY', total: Number(b.total_balance || 0), granted: Number(b.granted_balance || 0), topped_up: Number(b.topped_up_balance || 0) };
     } catch (e) { return { ok: false, error: String((e && e.message) || e).slice(0, 160) }; }
-}
-// ---------------- 订阅周期（按月续费的额度窗口） ----------------
-// 口径：周期＝以「下次续费时刻」为锚点往前推的日历月。锚点优先取 quota.usage 返回的 monthly.resets_at，
-// 取不到就按记过的锚点顺推，再退回 quota.cycle_day（默认 1 号）。
-// allowance 口径＝实际成本 × base_usd ÷ 该模型月上限，所以「归一化额度 ÷ base_usd」与上游面板百分比同口径。
-const GO_BASE_USD = Number((CFG.quota && CFG.quota.base_usd) || 60) || 60;
-const GO_CYCLE_COUNT = Number((CFG.quota && CFG.quota.cycle_count) || 6) || 6;
-function monthShift(ms, n) {               // 日历月平移，月末溢出回退到目标月最后一天
-    const d = new Date(ms), day = d.getUTCDate();
-    d.setUTCDate(1);
-    d.setUTCMonth(d.getUTCMonth() + n);
-    const last = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
-    d.setUTCDate(Math.min(day, last));
-    return d.getTime();
-}
-function usageCycleAnchor(quota) {         // 下次续费时刻（ms）；上游取不到就顺推上次记下的锚点
-    const iso = quota && quota.ok && quota.monthly && quota.monthly.resets_at;
-    const t = iso ? Date.parse(iso) : NaN;
-    if (Number.isFinite(t)) {
-        try { DB.prepare("INSERT OR REPLACE INTO meta(k,v) VALUES('quota_cycle_anchor',?)").run(String(t)); } catch { /* ignore */ }
-        return t;
-    }
-    const row = DB.prepare("SELECT v FROM meta WHERE k='quota_cycle_anchor'").get();
-    const prev = row ? Number(row.v) : NaN;
-    if (Number.isFinite(prev) && prev > 0) { let a = prev; while (a <= Date.now()) a = monthShift(a, 1); return a; }
-    const day = Math.min(28, Math.max(1, Number((CFG.quota || {}).cycle_day) || 1));   // 兜底：每月固定日
-    const now = new Date(), y = now.getUTCFullYear(), m = now.getUTCMonth();
-    const cand = Date.UTC(y, m, day);
-    return cand > now.getTime() ? cand : Date.UTC(y, m + 1, day);
-}
-function computeUsageCycles(anchorMs, count = GO_CYCLE_COUNT) {
-    const bounds = [];
-    for (let i = 0; i < count; i++) bounds.push({ lo: monthShift(anchorMs, -i - 1), hi: monthShift(anchorMs, -i) });
-    const oldest = bounds[bounds.length - 1].lo;
-    const out = bounds.map((b) => ({ start: b.lo, end: b.hi, reqs: 0, in: 0, out: 0, cached: 0, cost: 0, allow: 0, priced: 0, unpriced: 0, models: new Map() }));
-    const pfx = (CFG.quota || {}).provider_prefixes || [];
-    const cond = pfx.length ? ' AND (' + pfx.map(() => '(provider LIKE ? OR model LIKE ?)').join(' OR ') + ')' : '';
-    const rows = DB.prepare(`SELECT ts, model, provider, upstream_model, in_tok, out_tok, cached FROM requests
-        WHERE ts >= ?${cond}`).all(oldest, ...pfx.flatMap((p) => [p + '%', p + '%']));
-    for (const r of rows) {
-        const ts = r.ts || 0;
-        const e = out.find((c) => ts >= c.start && ts < c.end);
-        if (!e) continue;
-        const model = String(r.upstream_model || String(r.model || '').replace(/^[^/]*\//, ''));
-        const { cost, cap } = goModelCost(model, { in: r.in_tok || 0, out: r.out_tok || 0, cached: r.cached || 0 }, ts);
-        e.reqs++; e.in += r.in_tok || 0; e.out += r.out_tok || 0; e.cached += r.cached || 0;
-        if (cost == null) { e.unpriced++; continue; }          // 价格表里没有的模型只计请求数
-        e.priced++; e.cost += cost;
-        const allow = cap ? cost * GO_BASE_USD / cap : 0;      // cap=null → 不限额度
-        e.allow += allow;
-        const m = e.models.get(model) || { model, reqs: 0, in: 0, out: 0, cached: 0, cost: 0, allow: 0, cap };
-        m.reqs++; m.in += r.in_tok || 0; m.out += r.out_tok || 0; m.cached += r.cached || 0;
-        m.cost += cost; m.allow += allow; e.models.set(model, m);
-    }
-    return out.map((c) => ({
-        start: c.start, end: c.end, reqs: c.reqs, in: c.in, out: c.out, cached: c.cached,
-        cost: +c.cost.toFixed(4), allow: +c.allow.toFixed(4), pct: +(c.allow / GO_BASE_USD * 100).toFixed(2),
-        priced: c.priced, unpriced: c.unpriced,
-        models: [...c.models.values()].sort((a, b) => b.cost - a.cost).slice(0, 12)
-            .map((m) => ({
-                model: m.model, reqs: m.reqs, in: m.in, out: m.out, cached: m.cached,
-                cost: +m.cost.toFixed(4), allow: +m.allow.toFixed(4),
-                pct: m.cap ? +(m.cost / m.cap * 100).toFixed(2) : null,     // 占该模型自身月上限
-                cap: m.cap || null,
-            })),
-    }));
 }
 const QUOTA_TTL_MS = 5 * 60 * 1000;
 let QUOTA_CACHE = { t: 0, data: null };
@@ -2584,26 +3630,71 @@ function readBody(req) { return new Promise((resolve, reject) => { const c = [];
 const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
     const host = (req.headers.host || '').split(':')[0];
-    // 面板域名单独密码（Basic；只对配置里的域名生效，本机/容器内不受影响）
+    // 面板域名单独密码（Basic；只对配置里的域名生效，本机/容器内不受影响）。
+    // 有分用户登录后：Basic 仍可当管理员后备；不带 Basic 时不再弹浏览器密码框，改为页面内登录。
     const da = CFG.dashboard_auth || {};
     let dashOk = false;
-    if (da.enabled && Array.isArray(da.hosts) && da.hosts.includes(host)) {
+    // 页面内「登出」后置一个 cookie，让服务端忽略浏览器缓存的 Basic 凭据（Basic 无法用 JS 清除）。
+    const panelLoggedOut = /(?:^|;\s*)gw_panel_logout=1(?:;|$)/.test(String(req.headers.cookie || ''));
+    if (da.enabled && Array.isArray(da.hosts) && da.hosts.includes(host) && !panelLoggedOut) {
         const hdr = req.headers['authorization'] || '';
-        let ok = false;
         if (hdr.startsWith('Basic ')) {
             try {
                 const [u, p] = Buffer.from(hdr.slice(6), 'base64').toString('utf8').split(':');
                 const h = crypto.createHash('sha256').update((da.salt || '') + (p || '')).digest('hex');
-                ok = (u === da.username) && (h === da.password_sha256);
+                dashOk = (u === da.username) && (h === da.password_sha256);
             } catch { }
         }
-        if (!ok) {
-            res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="LLM Gateway", charset="UTF-8"', 'Content-Type': 'text/plain; charset=utf-8' });
-            return res.end('需要密码\n');
-        }
-        dashOk = true;
     }
-    if (url.pathname === '/healthz') return sendJson(res, 200, { ok: true, enabled: isEnabled(), capture: captureOn(), total: TOTAL, models: (CFG.models || []).length });
+    const who = url.pathname.startsWith('/api/') ? identityOf(req, dashOk) : null;   // 面板身份（/v1 数据面不算）
+    if (url.pathname === '/api/auth/me') {
+        if (!who || !who.panel) return sendJson(res, 401, { error: { message: '未登录' } });
+        return sendJson(res, 200, {
+            ok: true,
+            user: { name: who.name, role: who.role, via: who.via },
+            pools: who.admin ? Object.keys(CFG.pools || {}) : userPools(who.name),
+            joinable: who.admin ? [] : joinablePools(),
+        });
+    }
+    if (url.pathname === '/api/auth/login') {
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { message: 'POST only' } });
+        let b = {};
+        try { b = JSON.parse((await readBody(req)) || '{}'); } catch { return sendJson(res, 400, { error: { message: 'invalid json' } }); }
+        const ip = clientIp(req);
+        if (loginBlocked(ip)) return sendJson(res, 429, { error: { message: '尝试次数过多，请 10 分钟后再试' } });
+        const u = panelUser(b.username);
+        if (!u || !pwEq(u.password_sha256, hashPw(u.salt, b.password || ''))) {
+            loginFailed(ip);
+            log('LOGIN FAIL', String(b.username || ''), ip);
+            return sendJson(res, 401, { error: { message: '用户名或密码错误' } });
+        }
+        LOGIN_FAILS.delete(ip);
+        const token = newSession(u.name);
+        res.setHeader('Set-Cookie', 'gw_panel_logout=; Path=/; Max-Age=0; SameSite=Lax');   // 重新登录＝恢复 Basic 后备
+        log('LOGIN', u.name, ip);
+        return sendJson(res, 200, { ok: true, token, user: { name: u.name, role: u.role } });
+    }
+    if (url.pathname === '/api/auth/logout') {
+        const t = String(req.headers['x-gw-token'] || '').trim();
+        if (t && SESSIONS[t]) { delete SESSIONS[t]; saveSessions(); }
+        res.setHeader('Set-Cookie', 'gw_panel_logout=1; Path=/; Max-Age=31536000; SameSite=Lax');
+        log('LOGOUT', (who && who.name) || '', clientIp(req));
+        return sendJson(res, 200, { ok: true });
+    }
+    if (url.pathname === '/api/user/provider/fetch') {     // 用户填上游信息时先拉模型清单（不写配置、不打统计）
+        if (!who || !who.panel) return sendJson(res, 401, { error: { message: '未登录' } });
+        if (who.admin) return sendJson(res, 400, { error: { message: '管理员请用「增加供应商」页的拉取功能' } });
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { message: 'POST only' } });
+        let b = {};
+        try { b = JSON.parse((await readBody(req)) || '{}'); } catch { return sendJson(res, 400, { error: { message: 'invalid json' } }); }
+        const base = String(b.base_url || '').trim().replace(/\/+$/, '');
+        if (!/^https?:\/\//.test(base)) return sendJson(res, 400, { error: { message: 'base_url 必须以 http:// 或 https:// 开头' } });
+        try {
+            const ids = await fetchModelsFrom(base, String(b.api_key || '').trim(), {});
+            return sendJson(res, 200, { ok: true, models: ids });
+        } catch (e) { return sendJson(res, 400, { error: { message: e.message } }); }
+    }
+    if (url.pathname === '/healthz') { res.setHeader('Cache-Control', 'no-store'); return sendJson(res, 200, { ok: true, enabled: isEnabled(), capture: captureOn(), total: TOTAL, models: (CFG.models || []).length, api_base: CFG.api_base || '' }); }
     if (url.pathname === '/v1/models') {
         const mA = authenticate(req);
         if (!mA) return sendJson(res, 401, { error: { message: 'Invalid API key', type: 'invalid_request_error', code: 'invalid_api_key' } });
@@ -2648,27 +3739,28 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/' || url.pathname === '/dashboard') {
         try {
             const html = fs.readFileSync(path.join(ROOT, 'dashboard.html'), 'utf8');
-            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });   // 禁止浏览器缓存单页，改版后刷新即生效
             return res.end(html);
         } catch (e) { return sendJson(res, 500, { error: { message: 'dashboard.html 缺失: ' + e.message } }); }
     }
     if (url.pathname === '/api/stats/requests') {
-        if (!dashOk && !authenticate(req)) return sendJson(res, 401, { error: { message: 'Invalid API key', type: 'invalid_request_error', code: 'invalid_api_key' } });
+        if (!who || !who.panel) return sendJson(res, 401, { error: { message: 'Invalid API key', type: 'invalid_request_error', code: 'invalid_api_key' } });
         let q = {};
         if (req.method === 'POST') { try { q = JSON.parse((await readBody(req)) || '{}'); } catch { return sendJson(res, 400, { error: { message: 'invalid json' } }); } }
         else for (const [k, v] of url.searchParams.entries()) q[k] = v;
-        try { return sendJson(res, 200, queryRequests(q)); } catch (e) { return sendJson(res, 500, { error: { message: e.message } }); }
+        try { return sendJson(res, 200, queryRequests(q, who)); } catch (e) { return sendJson(res, 500, { error: { message: e.message } }); }
     }
-    if (url.pathname === '/api/upstream/quota') {          // 上游额度：余额接口 + 用量估算（都按 config.quota 配置）
-        if (!dashOk && !authenticate(req)) return sendJson(res, 401, { error: { message: 'Invalid API key', type: 'invalid_request_error', code: 'invalid_api_key' } });
+    if (url.pathname === '/api/upstream/quota') {          // 上游额度：余额（官方接口）+ 用量（本地按价格表估算）
+        if (!who || !who.panel) return sendJson(res, 401, { error: { message: 'Invalid API key', type: 'invalid_request_error', code: 'invalid_api_key' } });
+        if (!who.admin) return sendJson(res, 403, { error: { message: '只有管理员能看全量上游额度' } });
         const now = Date.now();
         const force = url.searchParams.get('refresh') === '1';
         if (force || !QUOTA_CACHE.data || now - QUOTA_CACHE.t > QUOTA_TTL_MS) {
             const ds = await upstreamBalance();
             const goQuota = await upstreamUsage();
             const go = computeGoUsage();
-            const anchor = usageCycleAnchor(goQuota);
-            const cycles = anchor ? computeUsageCycles(anchor) : null;
+            const anchor = goCycleAnchor(goQuota);
+            const cycles = anchor ? computeGoCycles(anchor) : null;
             QUOTA_CACHE = {
                 t: now,
                 data: {
@@ -2676,7 +3768,7 @@ const server = http.createServer(async (req, res) => {
                     balance: { ...ds, at: now },
                     usage: {
                         quota: goQuota,
-                        detail_note: '网关侧明细：按 config.prices 里的单价 × 本网关记录的 token 估算，只覆盖走本网关的流量',
+                        detail_note: '网关侧明细：按 config.prices 的单价 × 本网关记录的 token 估算，只覆盖走本网关的流量',
                         cycle_stats: cycles ? { anchor, base: GO_BASE_USD, cycles } : null,
                         ...go,
                     },
@@ -2686,7 +3778,7 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, QUOTA_CACHE.data);
     }
     if (url.pathname === '/api/stats') {
-        if (!dashOk && !authenticate(req)) return sendJson(res, 401, { error: { message: 'Invalid API key', type: 'invalid_request_error', code: 'invalid_api_key' } });
+        if (!who || !who.panel) return sendJson(res, 401, { error: { message: 'Invalid API key', type: 'invalid_request_error', code: 'invalid_api_key' } });
         // 概览页时间口径：?since=&until=（epoch ms，可只给一个）+ ?tz=（浏览器时区偏移分钟）
         // ?unit=hour|day 指定分桶口径（前端按区间给：今天/昨天/24h → hour，本周/本月/上月/全部 → day）
         const numParam = (k) => {
@@ -2703,12 +3795,14 @@ const server = http.createServer(async (req, res) => {
             const v = url.searchParams.get('dim');
             return v && DIM_EXPR[v] ? v : undefined;      // 只认 model / provider / key；其它值＝不分色（旧行为）
         };
-        return sendJson(res, 200, statsSnapshot({ since: numParam('since'), until: numParam('until'), tz: numParam('tz'), unit: unitParam(), dim: dimParam() }));
+        const modeParam = () => (url.searchParams.get('mode') === 'direct' ? 'direct' : 'pool');
+        return sendJson(res, 200, statsSnapshot({ since: numParam('since'), until: numParam('until'), tz: numParam('tz'), unit: unitParam(), dim: dimParam(), mode: modeParam() }, who));
     }
 
     // ---------------- 推理档位探测（面板） ----------------
     if (url.pathname === '/api/probe/efforts' || url.pathname === '/api/probe/efforts/bulk') {
-        if (!dashOk && !authenticate(req)) return sendJson(res, 401, { error: { message: 'unauthorized', type: 'invalid_request_error' } });
+        if (!who || !who.panel) return sendJson(res, 401, { error: { message: 'unauthorized', type: 'invalid_request_error' } });
+        if (!who.admin) return sendJson(res, 403, { error: { message: '只有管理员能探测推理档位' } });
         if (req.method !== 'POST') return sendJson(res, 405, { error: { message: 'POST only' } });
         let b = {};
         try { b = JSON.parse((await readBody(req)) || '{}'); } catch { return sendJson(res, 400, { error: { message: 'invalid json' } }); }
@@ -2757,27 +3851,70 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ---------------- 配置读写（面板密码通过 或 虚拟 key） ----------------
-    if (url.pathname.startsWith('/api/config')) {
-        if (!dashOk && !authenticate(req)) return sendJson(res, 401, { error: { message: 'unauthorized', type: 'invalid_request_error' } });
-        if (req.method === 'GET') return sendJson(res, 200, configView());
+    if (url.pathname === '/api/pool/health') {          // 上游组成员实时健康（内存态：谁在冷却、连续失败几次）
+        if (!who || !who.panel) return sendJson(res, 401, { error: { message: 'unauthorized', type: 'invalid_request_error' } });
+        if (url.searchParams.get('refresh') === '1') { try { await refreshQuotas(); } catch { } }   // 强制刷一次额度
+        // 普通用户只看自己加入/可加入的组，以及组内成员与自己供应商的额度
+        const showPools = who.admin ? null : new Set([...userPools(who.name), ...joinablePools()]);
+        const showProv = who.admin ? null : new Set(Object.entries(CFG.providers || {}).filter(([, p]) => p && p.owner === who.name).map(([n]) => n));
+        if (!who.admin) for (const pn of showPools) for (const m of poolMembers((CFG.pools || {})[pn])) showProv.add(m.provider);
+        const out = {};
+        for (const [k, v] of POOL_HEALTH) {
+            const i = k.indexOf('|');
+            const pool = k.slice(0, i), provider = k.slice(i + 1);
+            if (showPools && !showPools.has(pool)) continue;
+            (out[pool] = out[pool] || {})[provider] = { fails: v.fails || 0, until: v.until || 0 };
+        }
+        const inflight = {};
+        for (const [k, v] of POOL_INFLIGHT) {
+            const i = k.indexOf('|');
+            const pool = k.slice(0, i);
+            if (showPools && !showPools.has(pool)) continue;
+            (inflight[pool] = inflight[pool] || {})[k.slice(i + 1)] = v;
+        }
+        // 成员剩余额度（quota 策略用的即时值；没配额度查询的供应商不会出现在这里）
+        const quota = {};
+        for (const [n, s] of POOL_QUOTA_CACHE) {
+            if (showProv && !showProv.has(n)) continue;
+            quota[n] = {
+                ok: !!s.ok, source: s.source || 'none', error: s.error || '', at: s.at || 0,
+                headroom: Number.isFinite(s.headroom) ? s.headroom : null,
+                percent: Number.isFinite(s.percent) ? s.percent : null,
+                windows: s.windows || null, local: s.local || null,
+            };
+        }
+        return sendJson(res, 200, { ts: Date.now(), pools: out, inflight, quota });
+    }
+    if (url.pathname === '/api/user/provider' || url.pathname === '/api/user/leave') {
+        if (!who || !who.panel) return sendJson(res, 401, { error: { message: 'unauthorized', type: 'invalid_request_error' } });
+        if (req.method !== 'POST') return sendJson(res, 405, { error: { message: 'POST only' } });
         let b = {};
         try { b = JSON.parse((await readBody(req)) || '{}'); } catch { return sendJson(res, 400, { error: { message: 'invalid json' } }); }
         try {
-            if (url.pathname === '/api/config/key/reveal') {        // 回显 key：只允许看板域名（已登录）或本机
-                const localHost = ['127.0.0.1', 'localhost', '::1', 'gateway'].includes(host) || host.startsWith('172.28.');
-                if (!dashOk && !localHost) return sendJson(res, 403, { error: { message: '显示 key 只能在看板域名（登录后）或本机执行' } });
+            const out = applyConfigChange(url.pathname, b, who);
+            log('USER', url.pathname, 'by', who.name, JSON.stringify(out).slice(0, 160));
+            return sendJson(res, 200, { ok: true, ...out, config: configView(who) });
+        } catch (e) { return sendJson(res, 400, { error: { message: e.message } }); }
+    }
+    if (url.pathname.startsWith('/api/config')) {
+        if (!who || !who.panel) return sendJson(res, 401, { error: { message: 'unauthorized', type: 'invalid_request_error' } });
+        if (req.method === 'GET') return sendJson(res, 200, configView(who));
+        let b = {};
+        try { b = JSON.parse((await readBody(req)) || '{}'); } catch { return sendJson(res, 400, { error: { message: 'invalid json' } }); }
+        try {
+            if (url.pathname === '/api/config/key/reveal') {        // 回显 key：管理员看全部，普通用户只能看自己的
                 const name = String(b.name || '').trim();
                 const k = (CFG.keys || []).find((x) => x.name === name);
                 if (!k) return sendJson(res, 404, { error: { message: 'key 不存在: ' + name } });
-                log('CONFIG reveal key', name);
+                if (!who.admin && k.owner !== who.name) return sendJson(res, 403, { error: { message: '只能显示自己的 key' } });
+                log('CONFIG reveal key', name, 'by', who.name);
                 return sendJson(res, 200, { name, key: k.key });
             }
-            if (url.pathname === '/api/config/provider/detail') {   // 编辑用：回显供应商当前属性（含 UA/额外头），只允许看板域名（已登录）或本机
-                const localHost = ['127.0.0.1', 'localhost', '::1', 'gateway'].includes(host) || host.startsWith('172.28.');
-                if (!dashOk && !localHost) return sendJson(res, 403, { error: { message: '编辑供应商只能在看板域名（登录后）或本机执行' } });
+            if (url.pathname === '/api/config/provider/detail') {   // 编辑用：回显供应商当前属性（含 UA/额外头）
                 const name = String(b.name || '').trim();
                 const p = (CFG.providers || {})[name];
                 if (!p) return sendJson(res, 404, { error: { message: '供应商不存在: ' + name } });
+                if (!who.admin && p.owner !== who.name) return sendJson(res, 403, { error: { message: '只能查看自己的供应商' } });
                 const rt = (CFG.routes || []).find((r) => r.provider === name && r.strip);
                 return sendJson(res, 200, {
                     name,
@@ -2787,6 +3924,10 @@ const server = http.createServer(async (req, res) => {
                     has_key: !!(process.env[p.api_key_env] || '').length,
                     user_agent: p.user_agent || '',
                     reasoning_echo: !!p.reasoning_echo,
+                    strip_body_fields: Array.isArray(p.strip_body_fields) ? p.strip_body_fields : [],
+                    quota_url: p.quota_url || '',
+                    quota_url_auto: quotaUrlOf(p),
+                    quota: p.quota || null,
                     efforts: normEfforts((CFG.model_efforts || {})[effortKeyOf(name, '*')]),
                     test: providerIsTest(p),
                     extra_headers: p.extra_headers || {},
@@ -2794,18 +3935,23 @@ const server = http.createServer(async (req, res) => {
                 });
             }
             if (url.pathname === '/api/config/provider/models') {   // 拉取上游模型列表（不打网关统计）
+                if (!who.admin) {
+                    const prefix = String(b.prefix || '').trim().replace(/\/+$/, '');
+                    const rt = (CFG.routes || []).find((r) => r.strip === prefix + '/' && r.provider);
+                    if (!rt || ((CFG.providers || {})[rt.provider] || {}).owner !== who.name) return sendJson(res, 403, { error: { message: '只能拉取自己的供应商' } });
+                }
                 const out = await fetchProviderModels(b);
                 return sendJson(res, 200, { ok: true, ...out });
             }
-            const out = applyConfigChange(url.pathname, b);
-            log('CONFIG', url.pathname, JSON.stringify(out).slice(0, 200));
-            return sendJson(res, 200, { ok: true, ...out, config: configView() });
+            const out = applyConfigChange(url.pathname, b, who);
+            log('CONFIG', url.pathname, 'by', who.name, JSON.stringify(out).slice(0, 200));
+            return sendJson(res, 200, { ok: true, ...out, config: configView(who) });
         } catch (e) { return sendJson(res, 400, { error: { message: e.message } }); }
     }
     // ---------- 原生 Gemini 直通：客户端自带 Google 协议时原样转发（不做翻译）----------
     // 形状：/v1beta/models/<model>:generateContent 与 :streamGenerateContent[?alt=sse]
     // （同时接受 /v1/models/... 前缀，Google SDK 两种 base_url 都见过）
-    // 模型名可能自带前缀斜杠（对外名形如 ocg/gemini-...），所以这里不能用 [^/:]+ 排除斜杠
+    // 模型名可能自带前缀斜杠（对外名形如 pfx/model-a），所以这里不能用 [^/:]+ 排除斜杠
     const gemHit = /^\/(?:v1beta|v1)\/models\/(.+):(generateContent|streamGenerateContent)$/.exec(url.pathname);
     if (gemHit) {
         if (req.method !== 'POST') {
@@ -2827,10 +3973,15 @@ const server = http.createServer(async (req, res) => {
             record({ ts: t0, key: gAuth.name, model: gModel, stream: gemHit[2] === 'streamGenerateContent', ip: clientIp(req), passthrough: true, cproto: 'gemini', req_bytes: Buffer.byteLength(gRaw || ''), status: 403, ms: Date.now() - t0, provider: null, error: 'model_not_allowed' });
             return sendJson(res, 403, { error: { code: 403, status: 'PERMISSION_DENIED', message: `model "${gModel}" is not allowed for this key` } });
         }
-        const gRt = routeFor(gModel);
+        let gRt = routeFor(gModel, { stickyKey: gAuth.session_id });
         const gStream = gemHit[2] === 'streamGenerateContent';
         const gBase = { ts: t0, key: gAuth.name, model: gModel, stream: gStream, ip: clientIp(req), passthrough: true, cproto: 'gemini', conv: convFingerprint(gBody), req_bytes: Buffer.byteLength(gRaw || ''), res_bytes: 0, up_res_bytes: 0 };
+        gBase.pool = (gRt && gRt.poolPlan && gRt.poolPlan.name) || '';
         countOut(res, gBase);
+        if (gRt && gRt.__poolEmpty) {
+            record({ ...gBase, status: 400, ms: Date.now() - t0, provider: null });
+            return sendJson(res, 400, { error: { code: 400, status: 'INVALID_ARGUMENT', message: `上游组 "${gRt.pool}" 里没有能提供模型 "${gRt.upstream_model}" 的上游` } });
+        }
         if (!gRt) {
             record({ ...gBase, status: 400, ms: Date.now() - t0, provider: null });
             return sendJson(res, 400, { error: { code: 400, status: 'INVALID_ARGUMENT', message: `model "${gModel}" not routed` } });
@@ -2841,25 +3992,55 @@ const server = http.createServer(async (req, res) => {
             record({ ...gBase, status: 400, ms: Date.now() - t0, provider: gRt.provider, error: 'upstream format is ' + gUpFmt });
             return sendJson(res, 400, { error: { code: 400, status: 'FAILED_PRECONDITION', message: `模型 ${gModel} 的上游协议是 ${gUpFmt}，不是 gemini；Gemini 原生客户端目前只支持打 gemini 协议的上游` } });
         }
-        const gHeaders = upstreamHeaders(gRt.providerCfg, gAuth.session_id, gStream ? 'text/event-stream' : 'application/json', 'gemini');
-        // 客户端带来的生成参数原样保留，只把 model 从路径里的对外名换成上游名
-        const gPayload = { ...gBody };
-        const gUrl = gRt.providerCfg.base_url + '/models/' + encodeURIComponent(gRt.upstream_model) + ':' + gemHit[2] + (gStream ? '?alt=sse' : '');
+        // 上游池：按策略选候选成员，失败就换下一个（gemini 原生直通同样支持）
+        const gPlan = gRt.poolPlan || null;
+        const gAttempts = gPlan ? gPlan.order : [gRt];
         capture('client_req', { cproto: 'gemini', ip: clientIp(req), key: gAuth.name, model: gModel, stream: gStream, body: gBody });
-        capture('upstream_req', { cproto: 'gemini', url: gUrl, key: gAuth.name, model: gModel, upstream_model: gRt.upstream_model, payload: gPayload });
         try {
             const ac = new AbortController();
             const onClose = () => { if (!res.writableEnded) { try { ac.abort(); } catch { } } };
             req.on('close', onClose);
-            const up = await fetch(gUrl, { method: 'POST', headers: gHeaders, body: jdump(gPayload), signal: ac.signal });
-            capture('upstream_status', { cproto: 'gemini', status: up.status, ok: up.ok });
+            let up = null, upTxt = '', upStatus = 0, gLastRt = gRt;
+            const gTrail = [];
+            for (let i = 0; i < gAttempts.length; i++) {
+                const aRt = gAttempts[i];
+                gLastRt = aRt;
+                const gHeaders = upstreamHeaders(aRt.providerCfg, gAuth.session_id, gStream ? 'text/event-stream' : 'application/json', 'gemini', gAuth.user_agent);
+                // 客户端带来的生成参数原样保留，只把 model 从路径里的对外名换成上游名
+                const gPayload = { ...gBody };
+                stripBodyFields(gPayload, aRt.providerCfg.strip_body_fields, aRt.provider);
+                const gUrl = aRt.providerCfg.base_url + '/models/' + encodeURIComponent(aRt.upstream_model) + ':' + gemHit[2] + (gStream ? '?alt=sse' : '');
+                capture('upstream_req', { cproto: 'gemini', url: gUrl, provider: aRt.provider, key: gAuth.name, model: gModel, upstream_model: aRt.upstream_model, payload: gPayload });
+                try {
+                    up = await fetch(gUrl, { method: 'POST', headers: gHeaders, body: jdump(gPayload), signal: ac.signal });
+                    upStatus = up.status;
+                } catch (fe) {
+                    if (fe.name === 'AbortError') throw fe;
+                    up = null; upStatus = 0; upTxt = 'fetch failed: ' + fe.message;
+                    noteAttempt(gTrail, aRt.provider, 0, fe.message);
+                    log('PASSTHROUGH FETCH FAIL', aRt.provider, 'gemini', gModel, fe.message);
+                }
+                capture('upstream_status', { cproto: 'gemini', provider: aRt.provider, status: up ? up.status : 0, ok: !!up && up.ok });
+                if (up && up.ok) { gRt = aRt; if (gPlan) { poolMark(gPlan.name, aRt.provider, true, gPlan.def); log('POOL HIT', gPlan.name, aRt.provider, gModel); } break; }
+                if (up) { upTxt = await up.text(); upStatus = up.status; noteAttempt(gTrail, aRt.provider, upStatus, upTxt); }
+                if (gPlan) poolMark(gPlan.name, aRt.provider, false, gPlan.def);
+                if (gPlan && i < gAttempts.length - 1 && (!up || RETRYABLE_STATUS.has(upStatus))) {
+                    log('POOL FAILOVER', gPlan.name, aRt.provider, '->', gAttempts[i + 1].provider, `(${upStatus || 'network'})`);
+                    continue;
+                }
+                break;
+            }
             req.off('close', onClose);
-            if (!up.ok) {
-                const txt = await up.text();
+            if (!up || !up.ok) {
+                const txt = upTxt;
+                const gFail = gPlan ? poolFailBody(gPlan, gTrail, txt) : null;
+                const outStatus = gPlan ? poolFailStatus(gTrail) : (upStatus || 502);
                 let parsed = null; try { parsed = JSON.parse(txt); } catch { }
-                log('PASSTHROUGH ERROR', up.status, gRt.provider, 'gemini', gModel, txt.slice(0, 250));
-                record({ ...gBase, status: up.status, ms: Date.now() - t0, provider: gRt.provider, upstream_model: gRt.upstream_model, format: 'gemini', error: txt.slice(0, 500) });
-                return sendJson(res, up.status, parsed?.error ? parsed : { error: { code: up.status, message: txt.slice(0, 800) || 'upstream error' } });
+                log('PASSTHROUGH ERROR', outStatus, gLastRt.provider, 'gemini', gModel, String(gFail ? gFail.hint : txt).slice(0, 250));
+                record({ ...gBase, status: outStatus, ms: Date.now() - t0, provider: gLastRt.provider, upstream_model: gLastRt.upstream_model, format: 'gemini', error: String(gFail ? gFail.message : txt).slice(0, 500) });
+                return sendJson(res, outStatus, gFail
+                    ? { error: { code: outStatus, status: 'UNAVAILABLE', message: gFail.message, hint: gFail.hint, attempts: gFail.attempts } }
+                    : parsed?.error ? parsed : { error: { code: outStatus, message: txt.slice(0, 800) || 'upstream error' } });
             }
             if (gStream) {
                 if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
@@ -2929,9 +4110,14 @@ const server = http.createServer(async (req, res) => {
             record({ ts: t0, key: pAuth.name, model: pBody.model, stream: !!pBody.stream, ip: clientIp(req), passthrough: true, cproto: kind, conv: convFingerprint(pBody), req_bytes: Buffer.byteLength(pRaw || ''), status: 403, ms: Date.now() - t0, provider: null, error: 'model_not_allowed' });
             return sendJson(res, 403, { error: { message: `model "${pBody.model}" is not allowed for this key`, type: 'invalid_request_error', code: 'model_not_allowed' } });
         }
-        const pRt = routeFor(pBody.model);
+        let pRt = routeFor(pBody.model, { stickyKey: pAuth.session_id });
         const pBase = { ts: t0, key: pAuth.name, model: pBody.model, stream: !!pBody.stream, ip: clientIp(req), passthrough: true, cproto: kind, conv: convFingerprint(pBody), req_bytes: Buffer.byteLength(pRaw || ''), res_bytes: 0, up_res_bytes: 0 };
+        pBase.pool = (pRt && pRt.poolPlan && pRt.poolPlan.name) || '';
         countOut(res, pBase);
+        if (pRt && pRt.__poolEmpty) {
+            record({ ...pBase, status: 400, ms: Date.now() - t0, provider: null, error: 'pool_no_capable_member' });
+            return sendJson(res, 400, { error: { message: `上游组 "${pRt.pool}" 里没有能提供模型 "${pRt.upstream_model}" 的上游`, type: 'invalid_request_error', code: 'model_not_in_pool' } });
+        }
         if (!pRt) { record({ ...pBase, status: 400, ms: Date.now() - t0, provider: null }); return sendJson(res, 400, { error: { message: `model "${pBody.model}" not routed`, type: 'invalid_request_error' } }); }
         // 协议互转（按 key 开关 keys[].protocol_interop，默认关；看板「客户端 key」页可勾）：开启时
         // 「上游协议 != 客户端协议」走 chat 中枢互转；关闭时一律走下面的原生直通，由上游报协议不支持。
@@ -2940,31 +4126,62 @@ const server = http.createServer(async (req, res) => {
             log('CONVERT', kind, '->', upFmt, pBody.model);
             return serveChatPipeline(req, res, { auth: pAuth, rt: pRt, body: pBody, rawBody: pRaw, t0, clientProto: kind });
         }
-        const pHeaders = upstreamHeaders(pRt.providerCfg, pAuth.session_id, pBody.stream ? 'text/event-stream' : 'application/json', kind);
-        for (const hn of Object.keys(req.headers)) {                 // 把客户端的协议头原样带上去（anthropic-beta / openai-beta / x-stainless-*）
-            if (/^(anthropic-|openai-beta|x-stainless)/i.test(hn)) pHeaders[hn] = String(req.headers[hn]);
-        }
-        const pPayload = { ...clampBodyEffort(pBody, pRt), model: pRt.upstream_model };     // 只换模型名 + 档位就近降级，输入原样（含客户端自己回传的 reasoning item）
-        if (pRt.providerCfg.reasoning_echo && kind === 'responses' && Array.isArray(pBody.input)) {
-            const inj = injectReasonsIntoInput(pBody.input, pRt.provider);   // 客户端没回传的那几条，由网关补上（只补缺的、不重复、且只在同一供应商内）
-            if (inj.injected) { pPayload.input = inj.input; pBase.reason_inj = inj.injected; log('[reason] 直通补回', inj.injected, '条 ->', pBody.model); }
-        }
-        const pUrl = pRt.providerCfg.base_url + (kind === 'responses' ? '/responses' : '/messages');
+        // 上游池：按策略选出候选成员链，前面的人挂了就换下一个（只在写出任何字节之前换，流一旦开始就不折腾）
+        const pPlan = pRt.poolPlan || null;
+        const pAttempts = pPlan ? pPlan.order : [pRt];
         capture('client_req', { kind, ip: clientIp(req), key: pAuth.name, model: pBody.model, stream: !!pBody.stream, body: pBody });
-        capture('upstream_req', { kind, url: pUrl, key: pAuth.name, model: pBody.model, upstream_model: pRt.upstream_model, payload: pPayload });
         try {
             const ac = new AbortController();
             const onClose = () => { if (!res.writableEnded) { try { ac.abort(); } catch { } } };
             req.on('close', onClose);
-            const up = await fetch(pUrl, { method: 'POST', headers: pHeaders, body: jdump(pPayload), signal: ac.signal });
-            capture('upstream_status', { kind, status: up.status, ok: up.ok });
+            let up = null, upTxt = '', upStatus = 0, pLastRt = pRt;
+            const pTrail = [];
+            for (let i = 0; i < pAttempts.length; i++) {
+                const aRt = pAttempts[i];
+                pLastRt = aRt;
+                const pHeaders = upstreamHeaders(aRt.providerCfg, pAuth.session_id, pBody.stream ? 'text/event-stream' : 'application/json', kind, pAuth.user_agent);
+                for (const hn of Object.keys(req.headers)) {                 // 把客户端的协议头原样带上去（anthropic-beta / openai-beta / x-stainless-*）
+                    if (/^(anthropic-|openai-beta|x-stainless)/i.test(hn)) pHeaders[hn] = String(req.headers[hn]);
+                }
+                const pPayload = { ...clampBodyEffort(pBody, aRt), model: aRt.upstream_model };     // 只换模型名 + 档位就近降级，输入原样（含客户端自己回传的 reasoning item）
+                stripBodyFields(pPayload, aRt.providerCfg.strip_body_fields, aRt.provider);
+                if (aRt.providerCfg.reasoning_echo && kind === 'responses' && Array.isArray(pBody.input)) {
+                    const inj = injectReasonsIntoInput(pBody.input, aRt.provider);   // 客户端没回传的那几条，由网关补上（只补缺的、不重复、且只在同一供应商内）
+                    if (inj.injected) { pPayload.input = inj.input; pBase.reason_inj = inj.injected; log('[reason] 直通补回', inj.injected, '条 ->', pBody.model); }
+                }
+                const pUrl = aRt.providerCfg.base_url + (kind === 'responses' ? '/responses' : '/messages');
+                capture('upstream_req', { kind, url: pUrl, provider: aRt.provider, key: pAuth.name, model: pBody.model, upstream_model: aRt.upstream_model, payload: pPayload });
+                try {
+                    up = await fetch(pUrl, { method: 'POST', headers: pHeaders, body: jdump(pPayload), signal: ac.signal });
+                    upStatus = up.status;
+                } catch (fe) {
+                    if (fe.name === 'AbortError') throw fe;                       // 客户端断开：不重试
+                    up = null; upStatus = 0; upTxt = 'fetch failed: ' + fe.message;
+                    noteAttempt(pTrail, aRt.provider, 0, fe.message);
+                    log('PASSTHROUGH FETCH FAIL', aRt.provider, kind, pBody.model, fe.message);
+                }
+                capture('upstream_status', { kind, provider: aRt.provider, status: up ? up.status : 0, ok: !!up && up.ok });
+                if (up && up.ok) { pRt = aRt; if (pPlan) { poolMark(pPlan.name, aRt.provider, true, pPlan.def); log('POOL HIT', pPlan.name, aRt.provider, pBody.model); } break; }
+                if (up) { upTxt = await up.text(); upStatus = up.status; noteAttempt(pTrail, aRt.provider, upStatus, upTxt); }
+                if (pPlan) poolMark(pPlan.name, aRt.provider, false, pPlan.def);
+                if (pPlan && i < pAttempts.length - 1 && (!up || RETRYABLE_STATUS.has(upStatus))) {
+                    log('POOL FAILOVER', pPlan.name, aRt.provider, '->', pAttempts[i + 1].provider, `(${upStatus || 'network'})`);
+                    continue;
+                }
+                break;
+            }
             req.off('close', onClose);
-            if (!up.ok) {
-                const txt = await up.text();
+            if (!up || !up.ok) {
+                const txt = upTxt;
+                const pFail = pPlan ? poolFailBody(pPlan, pTrail, txt) : null;
+                const outStatus = pPlan ? poolFailStatus(pTrail) : (upStatus || 502);
                 let parsed = null; try { parsed = JSON.parse(txt); } catch { }
-                log('PASSTHROUGH ERROR', up.status, pRt.provider, kind, pBody.model, txt.slice(0, 250));
-                record({ ...pBase, status: up.status, ms: Date.now() - t0, provider: pRt.provider, upstream_model: pRt.upstream_model, format: kind, error: txt.slice(0, 500) });
-                return sendJson(res, up.status, parsed?.error ? { error: parsed.error } : { error: { message: txt.slice(0, 800) || 'upstream error', type: 'upstream_error' } });
+                log('PASSTHROUGH ERROR', outStatus, pLastRt.provider, kind, pBody.model, String(pFail ? pFail.hint : txt).slice(0, 250));
+                record({ ...pBase, status: outStatus, ms: Date.now() - t0, provider: pLastRt.provider, upstream_model: pLastRt.upstream_model, format: kind, error: String(pFail ? pFail.message : txt).slice(0, 500) });
+                const pErrBody = pFail
+                    ? { error: { message: pFail.message, type: 'upstream_pool_exhausted', code: 'upstream_unavailable', hint: pFail.hint, attempts: pFail.attempts } }
+                    : parsed?.error ? { error: parsed.error } : { error: { message: txt.slice(0, 800) || 'upstream error', type: 'upstream_error' } };
+                return sendJson(res, outStatus, pErrBody);
             }
             if (pBody.stream) {
                 if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
@@ -3069,7 +4286,13 @@ const server = http.createServer(async (req, res) => {
         log('DENY model', auth.name, body.model, '(白名单)');
         return sendJson(res, 403, { error: { message: `model "${body.model}" is not allowed for this key`, type: 'invalid_request_error', code: 'model_not_allowed' } });
     }
-    const rt = routeFor(body.model);
+    const rt = routeFor(body.model, { stickyKey: auth.session_id });
+    if (rt && rt.__poolEmpty) {                    // 组里没有能提供这个模型的上游（不是路由不存在）
+        const msg = `上游组 "${rt.pool}" 里没有能提供模型 "${rt.upstream_model}" 的上游：成员的可用模型里都没有它（或成员还没声明模型清单）`;
+        record({ ts: t0, key: auth.name, model: body.model, stream: !!body.stream, ip: clientIp(req), cproto: 'chat', req_bytes: Buffer.byteLength(rawBody || ''), status: 400, ms: Date.now() - t0, provider: null, error: 'pool_no_capable_member' });
+        log('POOL NO MODEL', rt.pool, rt.upstream_model);
+        return sendJson(res, 400, { error: { message: msg, type: 'invalid_request_error', code: 'model_not_in_pool' } });
+    }
     if (!rt) {
         record({ ts: t0, key: auth.name, model: body.model, stream: !!body.stream, ip: clientIp(req), cproto: 'chat', req_bytes: Buffer.byteLength(rawBody || ''), status: 400, ms: Date.now() - t0, provider: null });
         return sendJson(res, 400, { error: { message: `model "${body.model}" not routed`, type: 'invalid_request_error' } });
@@ -3077,5 +4300,12 @@ const server = http.createServer(async (req, res) => {
     return serveChatPipeline(req, res, { auth, rt, body, rawBody, t0, clientProto: 'chat' });
 });
 
+// 启动时补齐会话默认值（老配置缺 session_id、或 session_hosts 里的上游缺 x-upstream-session / UA 时自动修好并落盘）
+try { if (ensureSessionDefaults(CFG)) { saveConfig(CFG); reloadConfig(); log('SESSION defaults applied'); } } catch (e) { log('SESSION defaults FAILED', e.message); }
+
 const { host = '0.0.0.0', port = 8010 } = CFG.listen || {};
 server.listen(port, host, () => log(`gateway listening on ${host}:${port} — keys=${KEYS.size} models=${(CFG.models || []).length} env=${ENV_LOADED} providers=${Object.keys(CFG.providers || {}).length} hold=${HOLD_MS > 0 ? HOLD_MS / 1000 + 's/' + KA_MS / 1000 + 's' : 'off'}`));
+
+// 成员额度定时刷新：只有 quota 策略的池成员才会真去打接口，没配就是空转
+refreshQuotas().catch(() => { });
+setInterval(() => refreshQuotas().catch(() => { }), POOL_QUOTA_TTL_MS).unref?.();

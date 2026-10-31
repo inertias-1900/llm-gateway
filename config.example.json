@@ -5,14 +5,19 @@
   },
   "enabled": true,
   "capture": false,
+  "session_hosts": [
+    "api.upstream-a.example.com"
+  ],
   "keys": [
     {
       "name": "client-a",
-      "key": "sk-gw-REPLACE_ME",
+      "key": "sk-gw-change-me",
       "session_id": "00000000-0000-0000-0000-000000000001",
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
       "protocol_interop": false
     }
   ],
+  "users": {},
   "providers": {
     "upstream-a": {
       "base_url": "https://api.upstream-a.example.com/v1",
@@ -28,10 +33,32 @@
       "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
     }
   },
+  "pools": {
+    "pool-a": {
+      "strategy": "sticky",
+      "cooldown_sec": 60,
+      "max_fails": 2,
+      "quota_margin": 2,
+      "user_join": false,
+      "members": [
+        {
+          "provider": "upstream-a",
+          "weight": 3
+        },
+        {
+          "provider": "upstream-b",
+          "weight": 1,
+          "models": [
+            "some-model"
+          ]
+        }
+      ]
+    }
+  },
   "routes": [
     {
       "model_regex": "^a/",
-      "provider": "upstream-a",
+      "pool": "pool-a",
       "strip": "a/",
       "format": "auto",
       "responses_regex": "^(gpt-|grok-)"
@@ -51,6 +78,7 @@
     "upstream-a|some-model": "responses"
   },
   "dashboard_auth": {
+    "username": "admin",
     "hosts": []
   },
   "prices": {
